@@ -33,8 +33,6 @@ RUN pip install --no-cache-dir packaging
 # This ensures torch is installed before flash-attn needs it.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Now, install flash-attn, which depends on a pre-existing torch installation
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
 # Copy your application code into the container
 COPY ./app /app/app
