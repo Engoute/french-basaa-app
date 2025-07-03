@@ -43,7 +43,9 @@ def download_and_unzip(zip_name, file_info):
         zip_path = os.path.join(MODELS_DIR, zip_name)
         print(f"Downloading {zip_name}...")
         os.makedirs(MODELS_DIR, exist_ok=True)
-        gdown.download(url=file_info["url"], output=zip_path, quiet=False)
+        # Add fuzzy=True to handle the sharing link correctly
+        gdown.download(url=file_info["url"], output=zip_path, quiet=False, fuzzy=True)
+        
         print(f"Unzipping to {file_info['extract_path']}...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(file_info["extract_path"])
