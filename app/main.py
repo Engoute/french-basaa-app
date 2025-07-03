@@ -1,4 +1,3 @@
-# In app/main.py
 import os
 import torch
 import zipfile
@@ -6,12 +5,12 @@ import gdown
 import numpy as np
 import io
 import soundfile as sf
+import sys
+import shutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # Import the exact classes we discovered
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, M2M100ForConditionalGeneration, M2M100Tokenizer
-from orpheus.model import Orpheus
-from orpheus.inference.inference import InferenceBackend
 
 # --- Configuration ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,6 +21,11 @@ MODELS_DIR = "/app/models"
 ASR_MODEL_PATH = os.path.join(MODELS_DIR, "whisper_fr_inference_v1")
 MT_MODEL_PATH = os.path.join(MODELS_DIR, "m2m100_basaa_inference_v1")
 TTS_MODEL_PATH = os.path.join(MODELS_DIR, "orpheus_basaa_bundle_16bit_final")
+
+# Add the Orpheus model folder to Python's path so we can import it
+sys.path.append(TTS_MODEL_PATH)
+from orpheus.model import Orpheus
+from orpheus.inference.inference import InferenceBackend
 
 MODEL_FILES = {
     "whisper_fr_inference_v1.zip": { "url": "https://drive.google.com/file/d/1reOzKsylgFqPVaWZcSG4knPVNrJW-Hca/view?usp=sharing", "extract_path": ASR_MODEL_PATH },
@@ -38,18 +42,42 @@ tts_model = None
 app = FastAPI()
 
 def download_and_unzip(zip_name, file_info):
+    """
+    Downloads and unzips model files, handling nested folders correctly.
+    """
     if not os.path.exists(file_info["extract_path"]):
         zip_path = os.path.join(MODELS_DIR, zip_name)
         print(f"Downloading {zip_name}...")
         os.makedirs(MODELS_DIR, exist_ok=True)
         gdown.download(url=file_info["url"], output=zip_path, quiet=False)
+        
+        # Unzip to a temporary directory
+        temp_extract_dir = os.path.join(MODELS_DIR, "temp_unzip")
         print(f"Unzipping {zip_name}...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(file_info["extract_path"])
+            zip_ref.extractall(temp_extract_dir)
+        
+        # Find the single directory inside the temp folder
+        unzipped_contents = os.listdir(temp_extract_dir)
+        # Filter out potential system files like __MACOSX
+        unzipped_root_dir = next((item for item in unzipped_contents if not item.startswith('__')), None)
+
+        if unzipped_root_dir:
+            # Move the actual content to the target path
+            shutil.move(os.path.join(temp_extract_dir, unzipped_root_dir), file_info["extract_path"])
+        else:
+            # If no single root dir, assume contents are at the root
+            shutil.move(temp_extract_dir, file_info["extract_path"])
+            
+        # Clean up
         os.remove(zip_path)
+        if os.path.exists(temp_extract_dir):
+            shutil.rmtree(temp_extract_dir) # remove temp dir if it still exists
+            
         print(f"Model ready at {file_info['extract_path']}")
     else:
         print(f"Model folder {file_info['extract_path']} already exists. Skipping download.")
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -61,8 +89,8 @@ async def startup_event():
     
     # 1. Load ASR Model (Whisper)
     print("Loading ASR model...")
-    asr_processor = WhisperProcessor.from_pretrained(os.path.join(ASR_MODEL_PATH, 'whisper_fr_inference_v1'))
-    asr_model = WhisperForConditionalGeneration.from_pretrained(os.path.join(ASR_MODEL_PATH, 'whisper_fr_inference_v1')).to(DEVICE)
+    asr_processor = WhisperProcessor.from_pretrained(ASR_MODEL_PATH)
+    asr_model = WhisperForConditionalGeneration.from_pretrained(ASR_MODEL_PATH).to(DEVICE)
     print("✅ ASR model loaded.")
 
     # 2. Load MT Model (M2M100)
@@ -115,7 +143,7 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # Convert NumPy audio to WAV bytes in memory
             buffer = io.BytesIO()
-            sf.write(buffer, audio_out_np, tts_model.vocoder.sampling_rate, format='WAV')
+            sf.write(buffer, audio_out_np.squeeze(), tts_model.vocoder.sampling_rate, format='WAV')
             wav_bytes = buffer.getvalue()
             
             # 5. Send synthesized WAV audio back to the client
