@@ -26,17 +26,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install packaging, which is a dependency for flash-attn's setup
+# Install packaging, a dependency for flash-attn
 RUN pip install --no-cache-dir packaging
 
 # REORDERED: Install all main packages from requirements.txt FIRST
 # This ensures torch is installed before flash-attn needs it.
-# NEW: Added --timeout and --retries to make the download more robust
-RUN pip install \
-    --no-cache-dir \
-    --timeout=100 \
-    --retries=5 \
-    -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Now, install flash-attn, which depends on a pre-existing torch installation
 RUN pip install --no-cache-dir flash-attn --no-build-isolation
