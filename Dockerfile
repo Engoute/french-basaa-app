@@ -25,17 +25,14 @@ WORKDIR /app
 # Copy and install all Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
-
-# Install packaging, a dependency for flash-attn
-RUN pip install --no-cache-dir packaging
-
-# REORDERED: Install all main packages from requirements.txt FIRST
-# This ensures torch is installed before flash-attn needs it.
 RUN pip install --no-cache-dir -r requirements.txt
 
-
-# Copy your application code into the container
+# Copy your application code and setup file
 COPY ./app /app/app
+COPY setup.py .
+
+# Install your application code as a package
+RUN pip install .
 
 # Expose the port the app will run on
 EXPOSE 8000
