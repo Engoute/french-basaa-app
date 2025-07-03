@@ -32,7 +32,6 @@ MODEL_FILES = {
 # --- Model Placeholders ---
 asr_model, asr_processor = None, None
 mt_model, mt_tokenizer = None, None
-# TTS model is now two parts
 tts_acoustic_model, tts_tokenizer, tts_vocoder = None, None, None
 
 # --- FastAPI Application ---
@@ -43,7 +42,6 @@ def download_and_unzip(zip_name, file_info):
         zip_path = os.path.join(MODELS_DIR, zip_name)
         print(f"Downloading {zip_name}...")
         os.makedirs(MODELS_DIR, exist_ok=True)
-        # Add fuzzy=True to handle the sharing link correctly
         gdown.download(url=file_info["url"], output=zip_path, quiet=False, fuzzy=True)
         
         print(f"Unzipping to {file_info['extract_path']}...")
@@ -62,10 +60,11 @@ async def startup_event():
 
     print("--- Loading models into memory... ---")
     
-    # 1. Load ASR Model (Whisper)
+    # 1. Load ASR Model (Whisper) - with corrected subfolder path
     print("Loading ASR model...")
-    asr_processor = WhisperProcessor.from_pretrained(ASR_MODEL_PATH)
-    asr_model = WhisperForConditionalGeneration.from_pretrained(ASR_MODEL_PATH).to(DEVICE)
+    whisper_correct_path = os.path.join(ASR_MODEL_PATH, "whisper_large_v3_fr_int8")
+    asr_processor = WhisperProcessor.from_pretrained(whisper_correct_path)
+    asr_model = WhisperForConditionalGeneration.from_pretrained(whisper_correct_path).to(DEVICE)
     print("✅ ASR model loaded.")
 
     # 2. Load MT Model (M2M100)
@@ -74,7 +73,7 @@ async def startup_event():
     mt_model = M2M100ForConditionalGeneration.from_pretrained(MT_MODEL_PATH).to(DEVICE)
     print("✅ MT model loaded.")
     
-    # 3. Load TTS Model (Orpheus has two parts)
+    # 3. Load TTS Model (Orpheus)
     print("Loading TTS model...")
     acoustic_model_path = os.path.join(TTS_MODEL_PATH, "acoustic_model")
     vocoder_path = os.path.join(TTS_MODEL_PATH, "vocoder")
@@ -110,13 +109,11 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"Translated (Basaa): {basaa_text}")
             
             # Stage 3: TTS
-            # A: Generate audio tokens from text
             prompt = f"{tts_tokenizer.bos_token or ''}<|voice|>basaa_speaker<|text|>{basaa_text}{tts_tokenizer.eos_token or ''}<|audio|>"
             input_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
             with torch.no_grad():
                 generated_tokens_tts = tts_acoustic_model.generate(input_ids, max_new_tokens=4000, do_sample=True, pad_token_id=tts_tokenizer.pad_token_id, eos_token_id=tts_tokenizer.eos_token_id)
             
-            # B: Post-process the tokens for the vocoder
             llm_audio_token_ids = generated_tokens_tts[0][input_ids.shape[-1]:].tolist()
             raw_codes = [tok - 128266 - ((i % 7) * 4096) for i, tok in enumerate(llm_audio_token_ids)]
             num_frames = len(raw_codes) // 7
@@ -129,16 +126,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 codes[0].append(frame[0]); codes[1].extend([frame[1], frame[4]]); codes[2].extend([frame[2], frame[3], frame[5], frame[6]])
             codes_for_decode = [torch.tensor(c, dtype=torch.long).unsqueeze(0).to(DEVICE) for c in codes]
 
-            # C: Decode tokens to get sound waves
             with torch.no_grad(): 
                 waveform = tts_vocoder.decode(codes_for_decode)
             
-            # D: Convert to WAV bytes
             buffer = io.BytesIO()
             sf.write(buffer, waveform.squeeze(0).cpu().numpy(), 24000, format='WAV')
             wav_bytes = buffer.getvalue()
             
-            # 5. Send synthesized WAV audio back to the client
             await websocket.send_bytes(wav_bytes)
             print("Sent audio response to client.")
 
