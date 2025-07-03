@@ -27,12 +27,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your application code and setup file
+# Copy your application code into the container
 COPY ./app /app/app
-COPY setup.py .
-
-# Install your application code as a package
-RUN pip install .
 
 # Expose the port the app will run on
 EXPOSE 8000
