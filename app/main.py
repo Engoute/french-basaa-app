@@ -9,7 +9,9 @@ import shutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # Import the exact classes we discovered
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, M2M100ForConditionalGeneration, M2M100Tokenizer
+from snac import SNAC
 
 # --- Configuration ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,11 +23,6 @@ ASR_MODEL_PATH = os.path.join(MODELS_DIR, "whisper_fr_inference_v1")
 MT_MODEL_PATH = os.path.join(MODELS_DIR, "m2m100_basaa_inference_v1")
 TTS_MODEL_PATH = os.path.join(MODELS_DIR, "orpheus_basaa_bundle_16bit_final")
 
-# Add the Orpheus model folder to Python's path so we can import it
-
-from orpheus.model import Orpheus
-from orpheus.inference.inference import InferenceBackend
-
 MODEL_FILES = {
     "whisper_fr_inference_v1.zip": { "url": "https://drive.google.com/file/d/1reOzKsylgFqPVaWZcSG4knPVNrJW-Hca/view?usp=sharing", "extract_path": ASR_MODEL_PATH },
     "m2m100_basaa_inference_v1.zip": { "url": "https://drive.google.com/file/d/15iOWnGQnaVTB5mTKRNRHE2CKAKca3dxN/view?usp=sharing", "extract_path": MT_MODEL_PATH },
@@ -35,52 +32,29 @@ MODEL_FILES = {
 # --- Model Placeholders ---
 asr_model, asr_processor = None, None
 mt_model, mt_tokenizer = None, None
-tts_model = None
+# TTS model is now two parts
+tts_acoustic_model, tts_tokenizer, tts_vocoder = None, None, None
 
 # --- FastAPI Application ---
 app = FastAPI()
 
 def download_and_unzip(zip_name, file_info):
-    """
-    Downloads and unzips model files, handling nested folders correctly.
-    """
     if not os.path.exists(file_info["extract_path"]):
         zip_path = os.path.join(MODELS_DIR, zip_name)
         print(f"Downloading {zip_name}...")
         os.makedirs(MODELS_DIR, exist_ok=True)
         gdown.download(url=file_info["url"], output=zip_path, quiet=False)
-        
-        # Unzip to a temporary directory
-        temp_extract_dir = os.path.join(MODELS_DIR, "temp_unzip")
-        print(f"Unzipping {zip_name}...")
+        print(f"Unzipping to {file_info['extract_path']}...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_extract_dir)
-        
-        # Find the single directory inside the temp folder
-        unzipped_contents = os.listdir(temp_extract_dir)
-        # Filter out potential system files like __MACOSX
-        unzipped_root_dir = next((item for item in unzipped_contents if not item.startswith('__')), None)
-
-        if unzipped_root_dir:
-            # Move the actual content to the target path
-            shutil.move(os.path.join(temp_extract_dir, unzipped_root_dir), file_info["extract_path"])
-        else:
-            # If no single root dir, assume contents are at the root
-            shutil.move(temp_extract_dir, file_info["extract_path"])
-            
-        # Clean up
+            zip_ref.extractall(file_info["extract_path"])
         os.remove(zip_path)
-        if os.path.exists(temp_extract_dir):
-            shutil.rmtree(temp_extract_dir) # remove temp dir if it still exists
-            
         print(f"Model ready at {file_info['extract_path']}")
     else:
         print(f"Model folder {file_info['extract_path']} already exists. Skipping download.")
 
-
 @app.on_event("startup")
 async def startup_event():
-    global asr_model, asr_processor, mt_model, mt_tokenizer, tts_model
+    global asr_model, asr_processor, mt_model, mt_tokenizer, tts_acoustic_model, tts_tokenizer, tts_vocoder
     for zip_name, file_info in MODEL_FILES.items():
         download_and_unzip(zip_name, file_info)
 
@@ -98,11 +72,14 @@ async def startup_event():
     mt_model = M2M100ForConditionalGeneration.from_pretrained(MT_MODEL_PATH).to(DEVICE)
     print("✅ MT model loaded.")
     
-    # 3. Load TTS Model (Orpheus)
+    # 3. Load TTS Model (Orpheus has two parts)
     print("Loading TTS model...")
-    orpheus_main_model_path = os.path.join(TTS_MODEL_PATH, "model")
-    backend = InferenceBackend(orpheus_main_model_path, torch_compile=False, device=DEVICE)
-    tts_model = Orpheus(backend)
+    acoustic_model_path = os.path.join(TTS_MODEL_PATH, "acoustic_model")
+    vocoder_path = os.path.join(TTS_MODEL_PATH, "vocoder")
+    
+    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(acoustic_model_path, torch_dtype="auto").to(DEVICE).eval()
+    tts_tokenizer = AutoTokenizer.from_pretrained(acoustic_model_path)
+    tts_vocoder = SNAC.from_pretrained(vocoder_path).to(DEVICE).eval()
     print("✅ TTS model loaded.")
 
     print("--- Startup complete. All models are ready. ---")
@@ -113,36 +90,50 @@ async def websocket_endpoint(websocket: WebSocket):
     print("Client connected.")
     try:
         while True:
-            # 1. Receive raw audio bytes from the client
             audio_bytes = await websocket.receive_bytes()
-            
-            # Convert bytes to a float array for Whisper
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # 2. ASR: French Audio -> French Text
+            # Stage 1: ASR
             input_features = asr_processor(audio_np, sampling_rate=16000, return_tensors="pt").input_features
             with torch.no_grad():
                 predicted_ids = asr_model.generate(input_features.to(DEVICE))
             french_text = asr_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
             print(f"Transcribed (FR): {french_text}")
 
-            # 3. MT: French Text -> Basaa Text
+            # Stage 2: MT
             encoded_fr = mt_tokenizer(french_text, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
-                generated_tokens = mt_model.generate(**encoded_fr, forced_bos_token_id=mt_tokenizer.get_lang_id("bas"))
-            basaa_text = mt_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+                generated_tokens_mt = mt_model.generate(**encoded_fr, forced_bos_token_id=mt_tokenizer.get_lang_id("bas"))
+            basaa_text = mt_tokenizer.batch_decode(generated_tokens_mt, skip_special_tokens=True)[0]
             print(f"Translated (Basaa): {basaa_text}")
             
-            # 4. TTS: Basaa Text -> Basaa Audio
+            # Stage 3: TTS
+            # A: Generate audio tokens from text
+            prompt = f"{tts_tokenizer.bos_token or ''}<|voice|>basaa_speaker<|text|>{basaa_text}{tts_tokenizer.eos_token or ''}<|audio|>"
+            input_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
             with torch.no_grad():
-                text_processed = tts_model.process_text(basaa_text)
-                result = tts_model.synthesize(text_processed, n_codes=3)
-                # Decode the audio codes to a NumPy array
-                audio_out_np = tts_model.decode(result['codes'])
+                generated_tokens_tts = tts_acoustic_model.generate(input_ids, max_new_tokens=4000, do_sample=True, pad_token_id=tts_tokenizer.pad_token_id, eos_token_id=tts_tokenizer.eos_token_id)
             
-            # Convert NumPy audio to WAV bytes in memory
+            # B: Post-process the tokens for the vocoder
+            llm_audio_token_ids = generated_tokens_tts[0][input_ids.shape[-1]:].tolist()
+            raw_codes = [tok - 128266 - ((i % 7) * 4096) for i, tok in enumerate(llm_audio_token_ids)]
+            num_frames = len(raw_codes) // 7
+            raw_codes = raw_codes[:num_frames * 7]
+            codes = [[], [], []]
+            for i in range(num_frames):
+                frame_start = i * 7
+                frame = raw_codes[frame_start:frame_start+7]
+                if any(not (0 <= code < 4096) for code in frame): continue
+                codes[0].append(frame[0]); codes[1].extend([frame[1], frame[4]]); codes[2].extend([frame[2], frame[3], frame[5], frame[6]])
+            codes_for_decode = [torch.tensor(c, dtype=torch.long).unsqueeze(0).to(DEVICE) for c in codes]
+
+            # C: Decode tokens to get sound waves
+            with torch.no_grad(): 
+                waveform = tts_vocoder.decode(codes_for_decode)
+            
+            # D: Convert to WAV bytes
             buffer = io.BytesIO()
-            sf.write(buffer, audio_out_np.squeeze(), tts_model.vocoder.sampling_rate, format='WAV')
+            sf.write(buffer, waveform.squeeze(0).cpu().numpy(), 24000, format='WAV')
             wav_bytes = buffer.getvalue()
             
             # 5. Send synthesized WAV audio back to the client
