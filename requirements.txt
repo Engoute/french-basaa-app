@@ -1,0 +1,22 @@
+# FastAPI web server
+fastapi
+uvicorn[standard]
+websockets
+
+# Core AI & System
+torch>=2.2.0
+torchaudio
+transformers>=4.42.1
+accelerate>=0.28.0
+
+# For M2M100 model
+sentencepiece
+
+# For downloading from Google Drive
+gdown
+
+# For in-memory audio processing
+soundfile
+
+# Custom SNAC library from GitHub
+snac @ git+https://github.com/hubertsiuzdak/snac.git
