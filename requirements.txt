@@ -1,22 +1,15 @@
-# FastAPI web server
 fastapi
 uvicorn[standard]
 websockets
 
-# Core AI & System
-torch>=2.2.0
-torchaudio
+# For Whisper & M2M100
 transformers>=4.42.1
-accelerate>=0.28.0
-
-# For M2M100 model
+bitsandbytes
+accelerate
 sentencepiece
 
-# For downloading from Google Drive
-gdown
-
-# For in-memory audio processing
+# For Audio
 soundfile
 
-# Custom SNAC library from GitHub
+# For OrpheusTTS Vocoder
 snac @ git+https://github.com/hubertsiuzdak/snac.git
