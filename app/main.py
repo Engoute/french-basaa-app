@@ -5,7 +5,6 @@ import gdown
 import numpy as np
 import io
 import soundfile as sf
-import sys
 import shutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -23,7 +22,7 @@ MT_MODEL_PATH = os.path.join(MODELS_DIR, "m2m100_basaa_inference_v1")
 TTS_MODEL_PATH = os.path.join(MODELS_DIR, "orpheus_basaa_bundle_16bit_final")
 
 # Add the Orpheus model folder to Python's path so we can import it
-sys.path.append(TTS_MODEL_PATH)
+
 from orpheus.model import Orpheus
 from orpheus.inference.inference import InferenceBackend
 
