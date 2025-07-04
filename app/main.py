@@ -1,5 +1,5 @@
-# app/main.py  – drop-in replacement for your Docker image
-import os, io, zipfile, shutil, tempfile, traceback
+# app/main.py  – models resident in VRAM, pushes JSON + WAV
+import os, io, zipfile, shutil, tempfile, traceback, json       # ← added json
 from pathlib import Path
 
 import gdown
@@ -142,6 +142,9 @@ async def translate(ws: WebSocket):
             bas = mt_tokenizer.batch_decode(trans_ids, skip_special_tokens=True)[0]
             print("LG:", bas)
 
+            # ---------- push texts first (JSON) ----------
+            await ws.send_text(json.dumps({"fr": fr, "lg": bas}, ensure_ascii=False))
+
             # ---------- TTS ----------
             prompt = (
                 f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>"
@@ -161,7 +164,7 @@ async def translate(ws: WebSocket):
             raw = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm_tok)]
             raw = raw[: (len(raw) // 7) * 7]            # trim partial frame
 
-            # ---- LONG-dtype fix (key change!) -----------------------------------
+            # ---- LONG-dtype fix & empty-frame guard ----
             tracks = [[], [], []]
             for i in range(0, len(raw), 7):
                 f = raw[i : i + 7]
@@ -171,11 +174,14 @@ async def translate(ws: WebSocket):
                 tracks[1].extend([f[1], f[4]])
                 tracks[2].extend([f[2], f[3], f[5], f[6]])
 
+            if not tracks[0]:           # nothing valid → skip audio
+                continue
+
             codes_for_decode = [
                 torch.tensor(track, dtype=torch.long, device=DEVICE).unsqueeze(0)
                 for track in tracks
             ]
-            # --------------------------------------------------------------------
+            # --------------------------------------------
 
             with torch.no_grad():
                 wav = tts_vocoder.decode(codes_for_decode).cpu().numpy().squeeze()
