@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-websockets
+websockets==10.4
 
 # For Whisper & M2M100
 transformers>=4.42.1
