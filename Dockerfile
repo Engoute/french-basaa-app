@@ -11,11 +11,16 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install
+# Copy requirements file first
 COPY requirements.txt .
+
+# Install gdown separately to ensure it's available
+RUN pip install --no-cache-dir gdown
+
+# Install all other packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# CORRECTED: Copy the entire 'app' directory
+# Copy your application code
 COPY app .
 
 # The command to run the application
