@@ -155,7 +155,7 @@ async def translate(websocket: WebSocket):
             mt_tokenizer.src_lang = "fr"
             enc_fr = mt_tokenizer(fr_text, return_tensors="pt").to(mt_model.device)
             with torch.no_grad():
-                gen_mt = mt_model.generate(**enc_fr, forced_bos_token_id=mt_tokenizer.get_lang_id("bas"))
+                gen_mt = mt_model.generate(**enc_fr, forced_bos_token_id=mt_tokenizer.get_lang_id("lg"))
             bas_text = mt_tokenizer.batch_decode(gen_mt, skip_special_tokens=True)[0]
             print("MT :", bas_text)
 
