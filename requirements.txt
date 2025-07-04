@@ -1,5 +1,7 @@
-fastapi
-uvicorn[standard]
+# Pinning networking libraries to a known stable set to resolve conflicts
+fastapi==0.95.2
+starlette==0.27.0
+uvicorn[standard]==0.22.0
 websockets==10.4
 
 # For Whisper & M2M100
