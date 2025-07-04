@@ -1,4 +1,4 @@
-# app/main.py  ── ready to COPY into your Docker image
+# app/main.py  – drop-in replacement for your Docker image
 import os, io, zipfile, shutil, tempfile, traceback
 from pathlib import Path
 
@@ -16,7 +16,7 @@ from transformers import (
 )
 from snac import SNAC
 
-# ─────────────────────────  CONFIG  ────────────────────────────
+# ───────────────────────── CONFIG ───────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
 ASR_MODEL_PATH = MODELS_DIR / "whisper_fr_inference_v1"
 MT_MODEL_PATH  = MODELS_DIR / "m2m100_basaa_inference_v1"
@@ -29,15 +29,15 @@ MODEL_URLS = {
     "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
 }
 
-# ────────────────────  GLOBAL PLACE-HOLDERS  ───────────────────
+# ─────────────────── GLOBAL SINGLETONS ──────────────────────────
 asr_model = asr_processor = mt_model = mt_tokenizer = None
 tts_acoustic_model = tts_tokenizer = tts_vocoder = None
 
 app = FastAPI()
 
-# ───────────────────────  HELPERS  ─────────────────────────────
+# ────────────────────── HELPERS ─────────────────────────────────
 def safe_unzip(zip_path: Path, final_dir: Path, url: str):
-    """Download → unzip → move the real model root into final_dir (idempotent)."""
+    """Download → unzip → move model root into `final_dir` (idempotent)."""
     if final_dir.joinpath("config.json").exists():
         print(f"{final_dir} already present – skip download")
         return
@@ -55,63 +55,66 @@ def safe_unzip(zip_path: Path, final_dir: Path, url: str):
     print(f"✓ extracted to {final_dir}")
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
-    """Accept WAV or raw-PCM and always return little-endian int16 ndarray."""
-    if blob[:4] == b"RIFF":                       # WAV header
+    """Return int16 ndarray regardless of WAV/raw input."""
+    if blob[:4] == b"RIFF":                               # WAV header
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
             raise ValueError(f"WAV must be 16 kHz, got {sr}")
         return data
     return np.frombuffer(blob, np.int16)
 
-def load_models_once() -> bool:
+def load_models() -> bool:
+    """Download (if missing) and load **once** into GPU."""
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
     try:
+        # ── ensure files exist ───────────────────────────────
         safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
         safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
         safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
 
-        if asr_model is None:
-            asr_processor = AutoProcessor.from_pretrained(ASR_MODEL_PATH, local_files_only=True)
-            asr_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                ASR_MODEL_PATH, torch_dtype=torch.float16,
-                low_cpu_mem_usage=True, device_map="auto")
-            print("✓ ASR ready")
+        # ── ASR ──────────────────────────────────────────────
+        asr_processor = AutoProcessor.from_pretrained(ASR_MODEL_PATH, local_files_only=True)
+        asr_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            ASR_MODEL_PATH,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+        )
+        print("✓ ASR ready")
 
-        if mt_model is None:
-            mt_tokenizer = AutoTokenizer.from_pretrained(MT_MODEL_PATH, local_files_only=True)
-            mt_model = M2M100ForConditionalGeneration.from_pretrained(MT_MODEL_PATH, device_map="auto")
-            print("✓ MT ready")
+        # ── MT ───────────────────────────────────────────────
+        mt_tokenizer = AutoTokenizer.from_pretrained(MT_MODEL_PATH, local_files_only=True)
+        mt_model = M2M100ForConditionalGeneration.from_pretrained(MT_MODEL_PATH, device_map="auto")
+        print("✓ MT ready")
 
-        if tts_acoustic_model is None:
-            ac = TTS_MODEL_PATH / "acoustic_model"
-            vc = TTS_MODEL_PATH / "vocoder"
-            tts_tokenizer = AutoTokenizer.from_pretrained(ac, local_files_only=True)
-            tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac, torch_dtype="auto").to(DEVICE).eval()
-            tts_vocoder = SNAC.from_pretrained(vc, local_files_only=True).to(DEVICE).eval()
-            print("✓ TTS ready")
+        # ── TTS ──────────────────────────────────────────────
+        ac = TTS_MODEL_PATH / "acoustic_model"
+        vc = TTS_MODEL_PATH / "vocoder"
+        tts_tokenizer = AutoTokenizer.from_pretrained(ac, local_files_only=True)
+        tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac, torch_dtype="auto").to(DEVICE).eval()
+        tts_vocoder = SNAC.from_pretrained(vc, local_files_only=True).to(DEVICE).eval()
+        print("✓ TTS ready")
 
         return True
     except Exception as e:
-        print("Model-load failed:", e)
+        print("❌ Model-load failed:", e)
         traceback.print_exc()
         return False
 
-# ───────────────────  FASTAPI LIFECYCLE  ───────────────────────
+# ────────────────── FASTAPI LIFECYCLE ───────────────────────────
 @app.on_event("startup")
 async def _startup():
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    print("🌟  Pod started – models load on first request")
+    print("🚀 Pod booting – loading models into GPU…")
+    if not load_models():
+        raise RuntimeError("Failed to load models on startup")
+    print("🌟 All models resident in VRAM – ready!")
 
-# ──────────────────────  WEBSOCKET  ────────────────────────────
+# ─────────────────── WEBSOCKET ENDPOINT ─────────────────────────
 @app.websocket("/translate")
 async def translate(ws: WebSocket):
     await ws.accept()
-
-    if any(m is None for m in (asr_model, mt_model, tts_acoustic_model)):
-        if not load_models_once():
-            await ws.close(code=1011, reason="Model load failure")
-            return
 
     try:
         while True:
@@ -147,23 +150,35 @@ async def translate(ws: WebSocket):
             in_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
             with torch.no_grad():
                 out = tts_acoustic_model.generate(
-                    in_ids, max_new_tokens=4000, do_sample=True,
+                    in_ids,
+                    max_new_tokens=4000,
+                    do_sample=True,
                     pad_token_id=tts_tokenizer.pad_token_id,
-                    eos_token_id=tts_tokenizer.eos_token_id)
+                    eos_token_id=tts_tokenizer.eos_token_id,
+                )
 
             llm_tok = out[0][in_ids.shape[-1]:].tolist()
             raw = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm_tok)]
-            raw = raw[: (len(raw)//7)*7]                # trim partial frame
-            codes = [[], [], []]
+            raw = raw[: (len(raw) // 7) * 7]            # trim partial frame
+
+            # ---- LONG-dtype fix (key change!) -----------------------------------
+            tracks = [[], [], []]
             for i in range(0, len(raw), 7):
-                f = raw[i:i+7]
+                f = raw[i : i + 7]
                 if any(not 0 <= c < 4096 for c in f):
                     continue
-                codes[0].append(f[0]);  codes[1].extend([f[1], f[4]]);  codes[2].extend([f[2], f[3], f[5], f[6]])
+                tracks[0].append(f[0])
+                tracks[1].extend([f[1], f[4]])
+                tracks[2].extend([f[2], f[3], f[5], f[6]])
 
-            codes = [torch.tensor(c).unsqueeze(0).to(DEVICE) for c in codes]
+            codes_for_decode = [
+                torch.tensor(track, dtype=torch.long, device=DEVICE).unsqueeze(0)
+                for track in tracks
+            ]
+            # --------------------------------------------------------------------
+
             with torch.no_grad():
-                wav = tts_vocoder.decode(codes).cpu().numpy().squeeze()
+                wav = tts_vocoder.decode(codes_for_decode).cpu().numpy().squeeze()
 
             # ---------- SEND ----------
             buf = io.BytesIO()
@@ -172,6 +187,6 @@ async def translate(ws: WebSocket):
             print("🠔  sent audio")
 
     except Exception as e:
-        print("Runtime error:", e)
+        print("❌ Runtime error:", e)
         traceback.print_exc()
         await ws.close(code=1011, reason="Server exception")
