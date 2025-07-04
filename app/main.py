@@ -29,9 +29,9 @@ TTS_MODEL_PATH  = MODELS_DIR / "orpheus_basaa_bundle_16bit_final"
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_URLS = {
-    "whisper.zip": "https://drive.google.com/file/d/1reOzKsylgFqPVaWZcSG4knPVNrJW-Hca/view?usp=sharing",
-    "m2m100.zip":  "https://drive.google.com/file/d/15iOWnGQnaVTB5mTKRNRHE2CKAKca3dxN/view?usp=sharing",
-    "orpheus.zip": "https://drive.google.com/file/d/1MzgKfF7tvVr8QSTrwQ0bvb95aqfjj4S6/view?usp=sharing",
+    "whisper.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/whisper.zip",
+    "m2m100.zip":  "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/m2m100.zip",
+    "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
 }
 
 # ── Global model placeholders ─────────────────────────────────────────────────
