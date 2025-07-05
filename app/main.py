@@ -150,7 +150,7 @@ async def translate(ws: WebSocket):
             codes  = [torch.tensor(t,dtype=torch.long,device=DEVICE).unsqueeze(0) for t in tracks]
             wav    = tts_vocoder.decode(codes).cpu().numpy().squeeze()
 
-            buf = io.BytesIO(); sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
+            buf = io.BytesIO(); sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
             await ws.send_bytes(buf.getvalue())
 
             pcm_buffer.clear()                   # ready for next utterance
