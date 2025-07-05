@@ -148,7 +148,13 @@ async def translate(ws: WebSocket):
                 if any(not 0<=c<4096 for c in f): continue
                 tracks[0].append(f[0]); tracks[1].extend([f[1],f[4]]); tracks[2].extend([f[2],f[3],f[5],f[6]])
             codes  = [torch.tensor(t,dtype=torch.long,device=DEVICE).unsqueeze(0) for t in tracks]
-            wav    = tts_vocoder.decode(codes).cpu().numpy().squeeze()
+            wav = (
+                tts_vocoder.decode(codes)  # (B, C, T)
+                    .detach()              # ① break the grad graph
+                    .cpu()
+                    .numpy()
+                    .squeeze()
+            )    
 
             buf = io.BytesIO(); sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
             await ws.send_bytes(buf.getvalue())
