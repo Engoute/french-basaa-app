@@ -73,7 +73,7 @@ def _load_models() -> None:
 # ────────────────  STARTUP  ─────────────────────────────────────
 @app.on_event("startup")
 async def _startup() -> None:
-    MODELS_DIR.mkdir(Parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     print("🔄  loading models …")
     _load_models()
     print("✅  GPU ready")
