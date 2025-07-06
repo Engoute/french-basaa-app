@@ -5,8 +5,11 @@ from pathlib import Path
 import gdown, numpy as np, soundfile as sf, torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from transformers import (
-    AutoModelForSpeechSeq2Seq, AutoModelForCausalLM,
-    AutoProcessor, AutoTokenizer, M2M100ForConditionalGeneration
+    AutoModelForSpeechSeq2Seq,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    M2M100ForConditionalGeneration,
 )
 from snac import SNAC
 
@@ -31,6 +34,7 @@ app = FastAPI()
 
 # ─────────── Helpers ────────────────────────────────────────────
 def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
+    """Download a ZIP once and unpack it to `target` (idempotent)."""
     if target.joinpath("config.json").exists():
         return
     target.mkdir(parents=True, exist_ok=True)
@@ -44,12 +48,35 @@ def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
     os.remove(zip_path)
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
+    """Accept 16-kHz WAV or raw PCM16 → np.int16 array."""
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
             raise ValueError("WAV must be 16 kHz")
         return data
     return np.frombuffer(blob, np.int16)
+
+def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
+    """
+    Offline replacement for `SNAC.from_pretrained()` that works on a plain
+    folder containing `config.json` and the checkpoint referenced inside it.
+    """
+    cfg_path = model_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"SNAC config not found in {model_dir}")
+
+    with cfg_path.open() as f:
+        cfg_dict = json.load(f)
+
+    # build config & model objects exactly like snac does
+    from snac.configuration_snac import SnacConfig
+    snac_cfg = SnacConfig(**cfg_dict)
+    vocoder  = SNAC(snac_cfg)
+
+    ckpt_path = model_dir / cfg_dict["checkpoint"]
+    state     = torch.load(ckpt_path, map_location=device)
+    vocoder.load_state_dict(state)
+    return vocoder.to(device).eval()
 
 def load_models():
     global asr_model, asr_processor, mt_model, mt_tokenizer
@@ -73,31 +100,23 @@ def load_models():
     )
 
     # ── Orpheus (TTS) ───────────────────────────────────────────
-    # pick acoustic_model folder if it exists, else use bundle root
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():               # flattened layout after safe_unzip
-        ac_root = TTS_MODEL_PATH           # files live at bundle root
-    vc_root = TTS_MODEL_PATH / "vocoder"
+    if not ac_root.exists():                         # flattened layout
+        ac_root = TTS_MODEL_PATH
+    vc_root = TTS_MODEL_path / "vocoder"
 
-    # acoustic side
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
     tts_acoustic_model = (
         AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto")
         .to(DEVICE)
         .eval()
     )
+    tts_vocoder = load_snac_local(vc_root, DEVICE)
 
-        # vocoder side  (tell SNAC where the files really are)
-    tts_vocoder = (
-        SNAC.from_pretrained(
-            "local-vocoder",            # dummy repo_id that passes validation
-            local_dir=str(vc_root),     # actual folder with config.json/model.bin
-            local_files_only=True,
-        )
-        .to(DEVICE)
-        .eval()
-    )
-
+    # ── Performance knobs ───────────────────────────────────────
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 # ─────────── Startup ────────────────────────────────────────────
 @app.on_event("startup")
@@ -107,7 +126,7 @@ async def _startup():
     print("✅ Models loaded — server ready")
 
 # ─────────── WebSocket ──────────────────────────────────────────
-PING_EVERY = 25            # seconds
+PING_EVERY = 25  # seconds
 
 @app.websocket("/translate")
 async def translate(ws: WebSocket):
@@ -118,7 +137,7 @@ async def translate(ws: WebSocket):
         while True:
             await asyncio.sleep(PING_EVERY)
             try:
-                await ws.send_bytes(b"\x00")   # 1-byte ping
+                await ws.send_bytes(b"\x00")  # 1-byte ping
             except Exception:
                 break
 
@@ -128,22 +147,24 @@ async def translate(ws: WebSocket):
         while True:
             # ── receive mic chunk or close ───────────────────────
             try:
-                chunk = await asyncio.wait_for(ws.receive_bytes(), timeout=PING_EVERY+5)
+                chunk = await asyncio.wait_for(ws.receive_bytes(), timeout=PING_EVERY + 5)
                 pcm_buffer.extend(chunk)
-                continue                         # wait for more chunks
+                continue  # wait for more chunks
             except asyncio.TimeoutError:
-                # no new audio for a while → treat buffer as utterance
-                pass
+                pass  # treat buffer as utterance
             except WebSocketDisconnect:
                 break
 
             if not pcm_buffer:
-                continue                         # nothing yet
+                continue  # nothing yet
 
             # ── ASR ──────────────────────────────────────────────
             pcm16 = wav_to_pcm16(bytes(pcm_buffer)).astype(np.float32) / 32768.0
-            feats = asr_processor(pcm16, sampling_rate=16_000,
-                                  return_tensors="pt").input_features.to(asr_model.device).half()
+            feats = (
+                asr_processor(pcm16, sampling_rate=16_000, return_tensors="pt")
+                .input_features.to(asr_model.device)
+                .half()
+            )
             with torch.inference_mode():
                 txt_ids = asr_model.generate(feats)
             fr = asr_processor.batch_decode(txt_ids, skip_special_tokens=True)[0].strip()
@@ -160,7 +181,10 @@ async def translate(ws: WebSocket):
             await ws.send_text(json.dumps({"fr": fr, "lg": lg}))
 
             # ── TTS ─────────────────────────────────────────────
-            prompt = f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}{tts_tokenizer.eos_token}<|audio|>"
+            prompt = (
+                f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}"
+                f"{tts_tokenizer.eos_token}<|audio|>"
+            )
             token_in = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
             with torch.inference_mode():
@@ -171,35 +195,31 @@ async def translate(ws: WebSocket):
                     eos_token_id=tts_tokenizer.eos_token_id,
                 )
 
-                diff   = [t-128266-((i%7)*4096) for i,t in enumerate(llm[0][token_in.shape[-1]:])]
-                diff   = diff[: (len(diff)//7)*7]
+                diff = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
+                diff = diff[: (len(diff) // 7) * 7]
                 tracks = [[], [], []]
                 for i in range(0, len(diff), 7):
-                    f = diff[i:i+7]
+                    f = diff[i : i + 7]
                     if any(not 0 <= c < 4096 for c in f):
                         continue
                     tracks[0].append(f[0])
                     tracks[1].extend([f[1], f[4]])
                     tracks[2].extend([f[2], f[3], f[5], f[6]])
-                codes = [
-                    torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
-                    for t in tracks
-                ]
+                codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0) for t in tracks]
 
                 wav = (
-                    tts_vocoder.decode(codes)      # (1, C, T)
-                        .squeeze(0)                # (C, T)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .T                         # (T, C)  ← libsndfile accepts this
+                    tts_vocoder.decode(codes)  # (1, C, T)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .T  # (T, C)
                 )
 
             buf = io.BytesIO()
             sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
             await ws.send_bytes(buf.getvalue())
-
-            pcm_buffer.clear()                     # ready for next utterance
+            pcm_buffer.clear()  # ready for next utterance
 
     except Exception as e:
         print("❌", e)
