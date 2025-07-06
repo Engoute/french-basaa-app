@@ -72,24 +72,25 @@ def load_models():
         MT_MODEL_PATH, device_map="auto"
     )
 
-    # ── Orpheus (TTS) ───────────────────────────────────────────
-    # pick acoustic_model folder if it exists, else use bundle root
+        # ── Orpheus (TTS) ───────────────────────────────────────────
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():                  # flattened layout after safe_unzip
-        ac_root = TTS_MODEL_PATH              # files live at bundle root
+    if not ac_root.exists():            # flattened layout after safe_unzip
+        ac_root = TTS_MODEL_PATH
     vc_root = TTS_MODEL_PATH / "vocoder"
 
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
         ac_root, torch_dtype="auto"
     ).to(DEVICE).eval()
-    tts_vocoder = SNAC.from_pretrained(str(vc_root), local_files_only=True) \
-                         .to(DEVICE).eval()
 
-    # ── Performance knobs ───────────────────────────────────────
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    # 👇 THIS is the two-line defensive patch
+    #    cast vc_root to str before handing it to SNAC
+    tts_vocoder = (
+        SNAC.from_pretrained(str(vc_root), local_files_only=True)
+            .to(DEVICE)
+            .eval()
+    )
+
 
 # ─────────── Startup ────────────────────────────────────────────
 @app.on_event("startup")
