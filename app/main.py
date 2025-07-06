@@ -1,4 +1,4 @@
-# app/main.py – streaming + keep-alive (explicit "DONE" cue, no VAD timers)
+# app/main.py – streaming + keep‑alive (explicit "DONE" cue, no VAD timers)
 import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
 from pathlib import Path
 
@@ -13,14 +13,14 @@ from transformers import (
 )
 
 # ══════════════════════════════════════════════════════════════
-# SNAC loader (pinned to 48-channel build)
-#   requirements.txt → snac==1.2.1   or   @git+…@<48-channel-commit>
+# SNAC loader (pinned to 48‑channel build)
+#   requirements.txt → snac==1.2.1  or  snac @ git+…@<48‑channel‑commit>
 # ══════════════════════════════════════════════════════════════
 from snac import SNAC
 try:
-    from snac.configuration_snac import SnacConfig            # legacy wheels
+    from snac.configuration_snac import SnacConfig          # legacy wheels
 except ModuleNotFoundError:
-    class SnacConfig(dict):                                   # type: ignore
+    class SnacConfig(dict):                                 # type: ignore
         def __getattr__(self, k): return self[k]
 
 # ─────────────── paths & URLs ─────────────────────────────────
@@ -61,10 +61,11 @@ def resolve_dir(root: Path) -> Path:
     return next(root.rglob("config.json")).parent
 
 def wav_to_int16(blob: bytes) -> np.ndarray:
+    """Accept 16‑kHz WAV or raw PCM‑16, return np.int16 PCM."""
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
-            raise ValueError("expected 16-kHz WAV")
+            raise ValueError("expected 16 kHz WAV")
         return data
     return np.frombuffer(blob, np.int16)
 
@@ -135,10 +136,17 @@ async def translate(ws: WebSocket):
         while True:
             msg = await ws.receive()
 
-            # Explicit end-of-speech marker
-            if msg["type"] == "websocket.receive" and "text" in msg:
+            if msg["type"] != "websocket.receive":
+                continue
+
+            # explicit end‑of‑speech marker
+            if "text" in msg and msg["text"]:
                 if msg["text"] == "DONE":
                     break
+                continue
+
+            # binary audio frame (may be absent on text‑only events)
+            if "bytes" not in msg or msg["bytes"] is None:
                 continue
 
             pcm_chunks.append(wav_to_int16(msg["bytes"]))
