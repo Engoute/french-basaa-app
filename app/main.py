@@ -146,6 +146,11 @@ async def translate(ws: WebSocket):
         return
 
     # ───── ASR --------------------------------------------------
+    if not pcm_chunks:                         # ← NEW  (protect against empty)
+    await ws.close(code=4000, reason="no audio")
+    return
+
+    
     pcm = np.concatenate(pcm_chunks).astype(np.float32) / 32768.0
     feats = asr_processor(pcm, sampling_rate=16_000,
                           return_tensors="pt").input_features.to(asr_model.device).half()
