@@ -48,18 +48,22 @@ app = FastAPI()
 
 # ─────────── Helpers ────────────────────────────────────────────
 def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
-    """Download `url` once and unzip it to `target`."""
-    if target.joinpath("config.json").exists():
-        return
+    if target.exists() and any(target.iterdir()):
+        return                                   # already unpacked
+
     target.mkdir(parents=True, exist_ok=True)
     gdown.download(url=url, output=str(zip_path), quiet=False, fuzzy=True)
+
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-        root = next(Path(tmp).rglob("config.json")).parent
-        for p in root.iterdir():
-            shutil.move(str(p), target)
+
+        # move *everything* that was inside the zip, preserving structure
+        for p in Path(tmp).iterdir():
+            shutil.move(str(p), target)          # p may be a dir or file
+
     os.remove(zip_path)
+
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
     """Accept 16-kHz WAV or raw PCM16 and return np.int16 PCM."""
