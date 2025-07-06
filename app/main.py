@@ -1,4 +1,4 @@
-# app/main.py – streaming + keep‑alive (explicit "DONE" cue, no VAD timers)
+# app/main.py – streaming + keep-alive (explicit "DONE" cue, no VAD timers)
 import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
 from pathlib import Path
 
@@ -13,8 +13,8 @@ from transformers import (
 )
 
 # ══════════════════════════════════════════════════════════════
-# SNAC loader (pinned to 48‑channel build)
-#   requirements.txt → snac==1.2.1   or   @git+…@<48‑channel‑commit>
+# SNAC loader (pinned to 48-channel build)
+#   requirements.txt → snac==1.2.1   or   @git+…@<48-channel-commit>
 # ══════════════════════════════════════════════════════════════
 from snac import SNAC
 try:
@@ -64,7 +64,7 @@ def wav_to_int16(blob: bytes) -> np.ndarray:
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
-            raise ValueError("expected 16‑kHz WAV")
+            raise ValueError("expected 16-kHz WAV")
         return data
     return np.frombuffer(blob, np.int16)
 
@@ -135,7 +135,7 @@ async def translate(ws: WebSocket):
         while True:
             msg = await ws.receive()
 
-            # Explicit end‑of‑speech marker
+            # Explicit end-of-speech marker
             if msg["type"] == "websocket.receive" and "text" in msg:
                 if msg["text"] == "DONE":
                     break
@@ -146,11 +146,10 @@ async def translate(ws: WebSocket):
         return
 
     # ───── ASR --------------------------------------------------
-    if not pcm_chunks:                         # ← NEW  (protect against empty)
-    await ws.close(code=4000, reason="no audio")
-    return
+    if not pcm_chunks:                       # guard against empty input
+        await ws.close(code=4000, reason="no audio")
+        return
 
-    
     pcm = np.concatenate(pcm_chunks).astype(np.float32) / 32768.0
     feats = asr_processor(pcm, sampling_rate=16_000,
                           return_tensors="pt").input_features.to(asr_model.device).half()
