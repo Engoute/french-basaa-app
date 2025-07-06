@@ -1,5 +1,5 @@
 # app/main.py – streaming + keep‑alive (explicit "DONE" cue, no VAD timers)
-import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
+import asyncio, io, json, os, shutil, tempfile, zipfile
 from pathlib import Path
 
 import gdown, numpy as np, soundfile as sf, torch
@@ -14,7 +14,7 @@ from transformers import (
 
 # ══════════════════════════════════════════════════════════════
 # SNAC loader (pinned to 48‑channel build)
-#   requirements.txt → snac==1.2.1  or  snac @ git+…@<48‑channel‑commit>
+#   requirements.txt → snac==1.2.1  or  snac @git+…@<48‑ch‑commit>
 # ══════════════════════════════════════════════════════════════
 from snac import SNAC
 try:
@@ -23,7 +23,7 @@ except ModuleNotFoundError:
     class SnacConfig(dict):                                 # type: ignore
         def __getattr__(self, k): return self[k]
 
-# ─────────────── paths & URLs ─────────────────────────────────
+# ───────── paths & URLs ───────────────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
 ASR_MODEL_PATH = MODELS_DIR / "whisper_fr_inference_v1"
 MT_MODEL_PATH  = MODELS_DIR / "m2m100_basaa_inference_v1"
@@ -36,13 +36,13 @@ MODEL_URLS = {
     "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
 }
 
-# ─────────────── globals ──────────────────────────────────────
+# ───────── globals ────────────────────────────────────────────
 asr_model = asr_processor = mt_model = mt_tokenizer = None
 tts_acoustic_model = tts_tokenizer = tts_vocoder = None
 
 app = FastAPI()
 
-# ─────────────── helper fns ───────────────────────────────────
+# ───────── helpers ────────────────────────────────────────────
 def safe_unzip(zip_path: Path, dst_dir: Path, url: str) -> None:
     if dst_dir.exists() and any(dst_dir.iterdir()):
         return
@@ -56,12 +56,9 @@ def safe_unzip(zip_path: Path, dst_dir: Path, url: str) -> None:
     os.remove(zip_path)
 
 def resolve_dir(root: Path) -> Path:
-    if (root / "config.json").exists():
-        return root
-    return next(root.rglob("config.json")).parent
+    return root if (root / "config.json").exists() else next(root.rglob("config.json")).parent
 
 def wav_to_int16(blob: bytes) -> np.ndarray:
-    """Accept 16‑kHz WAV or raw PCM‑16, return np.int16 PCM."""
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
@@ -80,7 +77,7 @@ def load_snac(model_dir: Path, device="cpu") -> SNAC:
     print("✅  SNAC loaded")
     return voc
 
-# ─────────────── model bootstrap ──────────────────────────────
+# ───────── model bootstrap ────────────────────────────────────
 def load_models() -> None:
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
@@ -115,8 +112,8 @@ async def _startup() -> None:
     load_models()
     print("🌟 models in VRAM, server ready")
 
-# ─────────────── WebSocket endpoint ───────────────────────────
-PING_INTERVAL = 15  # s
+# ───────── WebSocket endpoint ─────────────────────────────────
+PING_INTERVAL = 15  # seconds
 
 @app.websocket("/translate")
 async def translate(ws: WebSocket):
@@ -136,25 +133,27 @@ async def translate(ws: WebSocket):
         while True:
             msg = await ws.receive()
 
-            if msg["type"] != "websocket.receive":
-                continue
+            # ➊ client closed socket
+            if msg["type"] == "websocket.disconnect":
+                return  # stop immediately, no further receive() allowed
 
-            # explicit end‑of‑speech marker
+            # ➋ explicit end‑of‑speech cue
             if "text" in msg and msg["text"]:
                 if msg["text"] == "DONE":
                     break
-                continue
+                continue  # ignore any other text
 
-            # binary audio frame (may be absent on text‑only events)
+            # ➌ skip events with no binary payload
             if "bytes" not in msg or msg["bytes"] is None:
                 continue
 
             pcm_chunks.append(wav_to_int16(msg["bytes"]))
+
     except WebSocketDisconnect:
         return
 
     # ───── ASR --------------------------------------------------
-    if not pcm_chunks:                       # guard against empty input
+    if not pcm_chunks:
         await ws.close(code=4000, reason="no audio")
         return
 
