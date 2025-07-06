@@ -12,6 +12,7 @@ from transformers import (
     M2M100ForConditionalGeneration,
 )
 from snac import SNAC
+from snac.configuration_snac import SnacConfig  # needed for the offline loader
 
 # ─────────── Config ─────────────────────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
@@ -34,7 +35,7 @@ app = FastAPI()
 
 # ─────────── Helpers ────────────────────────────────────────────
 def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
-    """Download a ZIP once and unpack it to `target` (idempotent)."""
+    """Download `url` once and unzip it to `target`."""
     if target.joinpath("config.json").exists():
         return
     target.mkdir(parents=True, exist_ok=True)
@@ -48,7 +49,7 @@ def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
     os.remove(zip_path)
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
-    """Accept 16-kHz WAV or raw PCM16 → np.int16 array."""
+    """Accept 16-kHz WAV or raw PCM16 and return np.int16 PCM."""
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
@@ -58,25 +59,20 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
 
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     """
-    Offline replacement for `SNAC.from_pretrained()` that works on a plain
-    folder containing `config.json` and the checkpoint referenced inside it.
+    Offline loader that mimics `SNAC.from_pretrained` without any HuggingFace Hub
+    look-ups.  Expects `config.json` + checkpoint in `model_dir`.
     """
-    cfg_path = model_dir / "config.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"SNAC config not found in {model_dir}")
+    cfg_file = model_dir / "config.json"
+    if not cfg_file.exists():
+        raise FileNotFoundError(f"Missing SNAC config: {cfg_file}")
 
-    with cfg_path.open() as f:
-        cfg_dict = json.load(f)
+    cfg = SnacConfig(**json.loads(cfg_file.read_text()))
+    voc = SNAC(cfg)
 
-    # build config & model objects exactly like snac does
-    from snac.configuration_snac import SnacConfig
-    snac_cfg = SnacConfig(**cfg_dict)
-    vocoder  = SNAC(snac_cfg)
-
-    ckpt_path = model_dir / cfg_dict["checkpoint"]
-    state     = torch.load(ckpt_path, map_location=device)
-    vocoder.load_state_dict(state)
-    return vocoder.to(device).eval()
+    ckpt_path = model_dir / cfg.checkpoint
+    state = torch.load(ckpt_path, map_location=device)
+    voc.load_state_dict(state)
+    return voc.to(device).eval()
 
 def load_models():
     global asr_model, asr_processor, mt_model, mt_tokenizer
@@ -94,23 +90,22 @@ def load_models():
     )
 
     # ── M2M-100 (MT) ────────────────────────────────────────────
-    mt_tokenizer  = AutoTokenizer.from_pretrained(MT_MODEL_PATH,  local_files_only=True)
-    mt_model      = M2M100ForConditionalGeneration.from_pretrained(
+    mt_tokenizer = AutoTokenizer.from_pretrained(MT_MODEL_PATH, local_files_only=True)
+    mt_model     = M2M100ForConditionalGeneration.from_pretrained(
         MT_MODEL_PATH, device_map="auto"
     )
 
     # ── Orpheus (TTS) ───────────────────────────────────────────
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():                         # flattened layout
+    if not ac_root.exists():                       # flattened layout
         ac_root = TTS_MODEL_PATH
-    vc_root = TTS_MODEL_path / "vocoder"
+    vc_root = TTS_MODEL_PATH / "vocoder"
 
+    # acoustic model
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
-    tts_acoustic_model = (
-        AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto")
-        .to(DEVICE)
-        .eval()
-    )
+    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto").to(DEVICE).eval()
+
+    # vocoder (offline loader – no Hub access)
     tts_vocoder = load_snac_local(vc_root, DEVICE)
 
     # ── Performance knobs ───────────────────────────────────────
@@ -149,22 +144,18 @@ async def translate(ws: WebSocket):
             try:
                 chunk = await asyncio.wait_for(ws.receive_bytes(), timeout=PING_EVERY + 5)
                 pcm_buffer.extend(chunk)
-                continue  # wait for more chunks
+                continue           # wait for more chunks
             except asyncio.TimeoutError:
-                pass  # treat buffer as utterance
+                pass               # treat buffer as utterance
             except WebSocketDisconnect:
                 break
 
             if not pcm_buffer:
-                continue  # nothing yet
+                continue
 
             # ── ASR ──────────────────────────────────────────────
             pcm16 = wav_to_pcm16(bytes(pcm_buffer)).astype(np.float32) / 32768.0
-            feats = (
-                asr_processor(pcm16, sampling_rate=16_000, return_tensors="pt")
-                .input_features.to(asr_model.device)
-                .half()
-            )
+            feats = asr_processor(pcm16, sampling_rate=16_000, return_tensors="pt").input_features.to(asr_model.device).half()
             with torch.inference_mode():
                 txt_ids = asr_model.generate(feats)
             fr = asr_processor.batch_decode(txt_ids, skip_special_tokens=True)[0].strip()
@@ -181,10 +172,7 @@ async def translate(ws: WebSocket):
             await ws.send_text(json.dumps({"fr": fr, "lg": lg}))
 
             # ── TTS ─────────────────────────────────────────────
-            prompt = (
-                f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}"
-                f"{tts_tokenizer.eos_token}<|audio|>"
-            )
+            prompt   = f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}{tts_tokenizer.eos_token}<|audio|>"
             token_in = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
             with torch.inference_mode():
@@ -213,13 +201,13 @@ async def translate(ws: WebSocket):
                     .detach()
                     .cpu()
                     .numpy()
-                    .T  # (T, C)
+                    .T                          # (T, C)
                 )
 
             buf = io.BytesIO()
             sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
             await ws.send_bytes(buf.getvalue())
-            pcm_buffer.clear()  # ready for next utterance
+            pcm_buffer.clear()
 
     except Exception as e:
         print("❌", e)
