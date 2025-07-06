@@ -1,5 +1,6 @@
 # app/main.py  –  GPU-resident models • chunk-streaming • keep-alive ping
 import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
+import contextlib, sys
 from pathlib import Path
 from typing import Optional
 
@@ -109,28 +110,33 @@ def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     return voc.to(device).eval()
 
 # ───────────────────────── model bootstrap ──────────────────────────────────
-def load_models() -> None:
-    global asr_model, asr_processor, mt_model, mt_tokenizer
-    global tts_acoustic_model, tts_tokenizer, tts_vocoder
 
-    # 1) ensure model folders exist (download+unzip once)
-    safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
-    safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
-    safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
 
-    # 2) Whisper ASR
-    asr_dir       = resolve_model_dir(ASR_MODEL_PATH)
-    asr_processor = AutoProcessor.from_pretrained(asr_dir, local_files_only=True)
-    asr_model     = AutoModelForSpeechSeq2Seq.from_pretrained(
-        asr_dir, torch_dtype=torch.float16, device_map="auto"
-    )
+def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
+    cfg_path = model_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"SNAC config not found: {cfg_path}")
 
-    # 3) M2M-100 MT
-    mt_dir       = resolve_model_dir(MT_MODEL_PATH)
-    mt_tokenizer = AutoTokenizer.from_pretrained(mt_dir, local_files_only=True)
-    mt_model     = M2M100ForConditionalGeneration.from_pretrained(
-        mt_dir, device_map="auto"
-    )
+    cfg = SnacConfig(**json.loads(cfg_path.read_text()))
+    voc = SNAC(cfg)
+
+    # find checkpoint
+    ckpt = model_dir / getattr(cfg, "checkpoint", "")
+    if not ckpt.exists():
+        ckpt = next(model_dir.glob("*.bin*"), None)
+    if not ckpt:
+        raise FileNotFoundError(f"SNAC weights not found in {model_dir}")
+
+    state = torch.load(ckpt, map_location=device)
+
+    # suppress PyTorch’s noisy printout
+    with contextlib.redirect_stdout(io.StringIO()):
+        voc.load_state_dict(state, strict=False)
+
+    # optional one-liner so you *know* it used the lenient path
+    print("⚠️  SNAC loaded with strict=False")
+
+    return voc.to(device).eval()
 
     # 4) Orpheus TTS
     ac_root = (TTS_MODEL_PATH / "acoustic_model") if (TTS_MODEL_PATH / "acoustic_model").exists() else TTS_MODEL_PATH
