@@ -70,31 +70,40 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, np.int16)
 
 # ─── offline SNAC loader (no Hub, quiet, strict=False) ──────────
-def load_snac_local(model_dir: Path, device="cpu") -> SNAC:
+def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
+    """
+    Load a SNAC vocoder entirely offline:
+
+    1. Reads `config.json` inside `model_dir`
+    2. Finds the checkpoint either from cfg["checkpoint"] or the first *.bin / *.safetensors
+    3. Tries strict=True first; if shapes don’t match it auto-retries strict=False
+    4. Silences SNAC / PyTorch verbosity
+    """
     cfg_file = model_dir / "config.json"
     if not cfg_file.exists():
-        raise FileNotFoundError(cfg_file)
+        raise FileNotFoundError(f"Missing SNAC config: {cfg_file}")
 
-    cfg   = SnacConfig(**json.loads(cfg_file.read_text()))
-    voc   = SNAC(cfg)
+    cfg = SnacConfig(**json.loads(cfg_file.read_text()))
+    voc = SNAC(cfg)
 
-    ckpt: Optional[Path] = getattr(cfg, "checkpoint", None)
-    if ckpt:
-        ckpt = model_dir / ckpt
-    else:
-        ckpt = next(model_dir.glob("*.bin*"), None)
-    if not ckpt or not ckpt.exists():
-        raise FileNotFoundError(f"weights not found under {model_dir}")
+    # locate checkpoint
+    ckpt_name = cfg.get("checkpoint")                 # <─ safe lookup: None if absent
+    ckpt      = (model_dir / ckpt_name) if ckpt_name else next(model_dir.glob("*.bin*"), None)
+    if ckpt is None or not ckpt.exists():
+        raise FileNotFoundError(f"SNAC weights not found in {model_dir}")
 
     state = torch.load(ckpt, map_location=device)
 
-    import contextlib, io as _io, sys
-    with contextlib.redirect_stdout(_io.StringIO()), \
-         contextlib.redirect_stderr(_io.StringIO()):
-        voc.load_state_dict(state, strict=False)
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            voc.load_state_dict(state, strict=True)
+        except RuntimeError:                          # size mismatch → fallback
+            voc.load_state_dict(state, strict=False)
 
     print("✅  SNAC vocoder loaded (strict=False, messages suppressed)")
     return voc.to(device).eval()
+
 
 # ────────── model bootstrap (runs once) ─────────────────────────
 def load_models() -> None:
