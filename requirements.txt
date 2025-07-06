@@ -1,17 +1,19 @@
-# Pinning networking libraries to a known stable set to resolve conflicts
+# ── Networking stack ───────────────────────────
 fastapi==0.95.2
 starlette==0.27.0
 uvicorn[standard]==0.22.0
 websockets==10.4
 
-# For Whisper & M2M100
+# ── Whisper & M2M100 ──────────────────────────
 transformers>=4.42.1
 bitsandbytes
 accelerate
 sentencepiece
 
-# For Audio
+# ── Audio ─────────────────────────────────────
 soundfile
 
-# For OrpheusTTS Vocoder
-snac @ git+https://github.com/hubertsiuzdak/snac.git
+# ── Orpheus TTS vocoder (pick ONE of the next two lines) ──
+snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71   # precise pin
+# snac==1.2.1                                                  # or PyPI pin
+
