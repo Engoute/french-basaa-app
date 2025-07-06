@@ -12,7 +12,20 @@ from transformers import (
     M2M100ForConditionalGeneration,
 )
 from snac import SNAC
-from snac.configuration_snac import SnacConfig  # needed for the offline loader
+
+# ------------------------------------------------------------------
+# optional import: only exists in the bleeding-edge snac repo
+try:
+    from snac.configuration_snac import SnacConfig        # type: ignore
+except ModuleNotFoundError:
+    class SnacConfig(dict):                               # minimalist shim
+        """Enough to satisfy SNAC(config) without touching the Hub."""
+        def __getattr__(self, k):
+            try:
+                return self[k]
+            except KeyError as e:
+                raise AttributeError(k) from e
+# ------------------------------------------------------------------
 
 # ─────────── Config ─────────────────────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
@@ -59,22 +72,19 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
 
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     """
-    Offline loader that mimics `SNAC.from_pretrained` without any HuggingFace Hub
-    look-ups.  Expects `config.json` + checkpoint in `model_dir`.
+    Offline loader that mimics `SNAC.from_pretrained` but never calls the Hub.
     """
-    cfg_file = model_dir / "config.json"
-    if not cfg_file.exists():
-        raise FileNotFoundError(f"Missing SNAC config: {cfg_file}")
+    cfg_path = model_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"SNAC config not found: {cfg_path}")
 
-    cfg = SnacConfig(**json.loads(cfg_file.read_text()))
-    voc = SNAC(cfg)
+    cfg      = SnacConfig(**json.loads(cfg_path.read_text()))
+    vocoder  = SNAC(cfg)
+    ckpt     = model_dir / cfg.checkpoint
+    vocoder.load_state_dict(torch.load(ckpt, map_location=device))
+    return vocoder.to(device).eval()
 
-    ckpt_path = model_dir / cfg.checkpoint
-    state = torch.load(ckpt_path, map_location=device)
-    voc.load_state_dict(state)
-    return voc.to(device).eval()
-
-def load_models():
+def load_models() -> None:
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
 
@@ -101,12 +111,9 @@ def load_models():
         ac_root = TTS_MODEL_PATH
     vc_root = TTS_MODEL_PATH / "vocoder"
 
-    # acoustic model
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto").to(DEVICE).eval()
-
-    # vocoder (offline loader – no Hub access)
-    tts_vocoder = load_snac_local(vc_root, DEVICE)
+    tts_vocoder        = load_snac_local(vc_root, DEVICE)
 
     # ── Performance knobs ───────────────────────────────────────
     torch.backends.cuda.enable_flash_sdp(True)
@@ -115,7 +122,7 @@ def load_models():
 
 # ─────────── Startup ────────────────────────────────────────────
 @app.on_event("startup")
-async def _startup():
+async def _startup() -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     load_models()
     print("✅ Models loaded — server ready")
@@ -135,7 +142,6 @@ async def translate(ws: WebSocket):
                 await ws.send_bytes(b"\x00")  # 1-byte ping
             except Exception:
                 break
-
     asyncio.create_task(keep_alive())
 
     try:
@@ -144,18 +150,19 @@ async def translate(ws: WebSocket):
             try:
                 chunk = await asyncio.wait_for(ws.receive_bytes(), timeout=PING_EVERY + 5)
                 pcm_buffer.extend(chunk)
-                continue           # wait for more chunks
+                continue
             except asyncio.TimeoutError:
-                pass               # treat buffer as utterance
+                pass
             except WebSocketDisconnect:
                 break
-
             if not pcm_buffer:
                 continue
 
             # ── ASR ──────────────────────────────────────────────
             pcm16 = wav_to_pcm16(bytes(pcm_buffer)).astype(np.float32) / 32768.0
-            feats = asr_processor(pcm16, sampling_rate=16_000, return_tensors="pt").input_features.to(asr_model.device).half()
+            feats = asr_processor(
+                pcm16, sampling_rate=16_000, return_tensors="pt"
+            ).input_features.to(asr_model.device).half()
             with torch.inference_mode():
                 txt_ids = asr_model.generate(feats)
             fr = asr_processor.batch_decode(txt_ids, skip_special_tokens=True)[0].strip()
@@ -183,8 +190,8 @@ async def translate(ws: WebSocket):
                     eos_token_id=tts_tokenizer.eos_token_id,
                 )
 
-                diff = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
-                diff = diff[: (len(diff) // 7) * 7]
+                diff   = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
+                diff   = diff[: (len(diff) // 7) * 7]
                 tracks = [[], [], []]
                 for i in range(0, len(diff), 7):
                     f = diff[i : i + 7]
