@@ -83,7 +83,8 @@ def load_models():
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
         ac_root, torch_dtype="auto"
     ).to(DEVICE).eval()
-    tts_vocoder        = SNAC.from_pretrained(vc_root, local_files_only=True).to(DEVICE).eval()
+    tts_vocoder = SNAC.from_pretrained(str(vc_root), local_files_only=True) \
+                         .to(DEVICE).eval()
 
     # ── Performance knobs ───────────────────────────────────────
     torch.backends.cuda.enable_flash_sdp(True)
