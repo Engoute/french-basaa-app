@@ -91,7 +91,7 @@ def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing SNAC config: {cfg_path}")
     cfg = SnacConfig(**json.loads(cfg_path.read_text()))
-    voc = SNAC(cfg).to(device)
+    voc = SNAC(**cfg).to(device)
 
     # Load checkpoint but drop every key whose tensor shape disagrees.
     ckpt_file = model_dir / "pytorch_model.bin"
