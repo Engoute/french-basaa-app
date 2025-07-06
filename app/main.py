@@ -141,34 +141,45 @@ async def translate(ws: WebSocket):
             token_in = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
             with torch.inference_mode():
-                llm = tts_acoustic_model.generate(token_in, max_new_tokens=4000,
-                                                   pad_token_id=tts_tokenizer.pad_token_id,
-                                                   eos_token_id=tts_tokenizer.eos_token_id)
+                llm = tts_acoustic_model.generate(
+                    token_in,
+                    max_new_tokens=4000,
+                    pad_token_id=tts_tokenizer.pad_token_id,
+                    eos_token_id=tts_tokenizer.eos_token_id,
+                )
 
                 diff   = [t-128266-((i%7)*4096) for i,t in enumerate(llm[0][token_in.shape[-1]:])]
                 diff   = diff[: (len(diff)//7)*7]
-                tracks = [[],[],[]]
-                for i in range(0,len(diff),7):
+                tracks = [[], [], []]
+                for i in range(0, len(diff), 7):
                     f = diff[i:i+7]
-                    if any(not 0<=c<4096 for c in f): continue
-                    tracks[0].append(f[0]); tracks[1].extend([f[1],f[4]]); tracks[2].extend([f[2],f[3],f[5],f[6]])
-                codes  = [torch.tensor(t,dtype=torch.long,device=DEVICE).unsqueeze(0) for t in tracks]
+                    if any(not 0 <= c < 4096 for c in f):
+                        continue
+                    tracks[0].append(f[0])
+                    tracks[1].extend([f[1], f[4]])
+                    tracks[2].extend([f[2], f[3], f[5], f[6]])
+                codes = [
+                    torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
+                    for t in tracks
+                ]
 
                 wav = (
-                    tts_vocoder.decode(codes)          # (1, C, T)
-                        .squeeze(0)
-                        .detach()                      # detach + cpu for numpy()
+                    tts_vocoder.decode(codes)      # (1, C, T)
+                        .squeeze(0)                # (C, T)
+                        .detach()
                         .cpu()
                         .numpy()
+                        .T                         # (T, C)  ← libsndfile accepts this
                 )
 
             buf = io.BytesIO()
             sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
             await ws.send_bytes(buf.getvalue())
 
-            pcm_buffer.clear()                         # ready for next utterance
+            pcm_buffer.clear()                     # ready for next utterance
 
     except Exception as e:
-        print("❌", e); traceback.print_exc()
+        print("❌", e)
+        traceback.print_exc()
         if not ws.client_state.name.startswith("CLOS"):
             await ws.close(code=1011, reason="server error")
