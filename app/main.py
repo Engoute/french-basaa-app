@@ -91,15 +91,33 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
 
 
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
-    """Offline loader that never touches HuggingFace Hub."""
+    """
+    Offline loader that mimics `SNAC.from_pretrained` without the Hub.
+    Works even when `config.json` lacks the 'checkpoint' field.
+    """
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"SNAC config not found: {cfg_path}")
-    cfg     = SnacConfig(**json.loads(cfg_path.read_text()))
+
+    cfg_dict = json.loads(cfg_path.read_text())
+
+    # ── locate checkpoint file ─────────────────────────────────
+    ckpt_name = cfg_dict.get("checkpoint")               # optional
+    ckpt_file = (model_dir / ckpt_name) if ckpt_name else None
+    if not ckpt_file or not ckpt_file.exists():
+        # pick the first plausible weight file
+        candidates = list(model_dir.glob("*.safetensors")) + list(model_dir.glob("*.bin"))
+        if not candidates:
+            raise FileNotFoundError(f"No *.bin or *.safetensors found in {model_dir}")
+        ckpt_file = candidates[0]
+    # make sure config knows the final filename (SNAC expects it)
+    cfg_dict["checkpoint"] = ckpt_file.name
+
+    cfg     = SnacConfig(**cfg_dict)
     vocoder = SNAC(cfg)
-    ckpt    = model_dir / cfg.checkpoint
-    vocoder.load_state_dict(torch.load(ckpt, map_location=device))
+    vocoder.load_state_dict(torch.load(ckpt_file, map_location=device))
     return vocoder.to(device).eval()
+
 
 
 def load_models() -> None:
