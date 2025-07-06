@@ -1,4 +1,4 @@
-# app/main.py  – GPU-resident models • chunk-streaming • keep-alive ping
+# app/main.py  – GPU models • chunk-streaming • keep-alive ping
 import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
 from pathlib import Path
 
@@ -14,12 +14,11 @@ from transformers import (
 from snac import SNAC
 
 # ------------------------------------------------------------------
-# optional import: only exists in the bleeding-edge snac repo
+# optional import: exists only in bleeding-edge snac
 try:
-    from snac.configuration_snac import SnacConfig        # type: ignore
+    from snac.configuration_snac import SnacConfig  # type: ignore
 except ModuleNotFoundError:
-    class SnacConfig(dict):                               # minimalist shim
-        """Enough to satisfy SNAC(config) without touching the Hub."""
+    class SnacConfig(dict):                         # tiny shim
         def __getattr__(self, k):
             try:
                 return self[k]
@@ -27,11 +26,11 @@ except ModuleNotFoundError:
                 raise AttributeError(k) from e
 # ------------------------------------------------------------------
 
-# ─────────── Config ─────────────────────────────────────────────
+# ─────────── Config ──────────────────────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
-ASR_MODEL_PATH = MODELS_DIR / "whisper_fr_inference_v1"
-MT_MODEL_PATH  = MODELS_DIR / "m2m100_basaa_inference_v1"
-TTS_MODEL_PATH = MODELS_DIR / "orpheus_basaa_bundle_16bit_final"
+ASR_MODEL_DIR  = MODELS_DIR / "whisper_fr_inference_v1"
+MT_MODEL_DIR   = MODELS_DIR / "m2m100_basaa_inference_v1"
+TTS_MODEL_DIR  = MODELS_DIR / "orpheus_basaa_bundle_16bit_final"
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_URLS = {
@@ -40,29 +39,20 @@ MODEL_URLS = {
     "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
 }
 
-# ─────────── Globals (loaded once) ──────────────────────────────
+# ─────────── Globals ─────────────────────────────────────────────
 asr_model = asr_processor = mt_model = mt_tokenizer = None
 tts_acoustic_model = tts_tokenizer = tts_vocoder = None
 
 app = FastAPI()
 
 # ─────────── Helpers ────────────────────────────────────────────
-def safe_unzip(
-    zip_path: Path,
-    target:   Path,
-    url:      str,
-    must_have: list[str],
-) -> None:
+def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
     """
-    Download `url` once and unzip into `target`, but only skip when **all**
-    `must_have` files are already present.  If the folder is incomplete it is
-    wiped and re-downloaded.
+    Download `url` once and unzip it into `target`.
+    If `target` already contains files, skip.
     """
-    if target.exists() and all((target / f).exists() for f in must_have):
-        return                                  # already have everything
-
-    if target.exists():
-        shutil.rmtree(target)                   # purge half-baked folder
+    if target.exists() and any(target.iterdir()):
+        return
     target.mkdir(parents=True, exist_ok=True)
 
     gdown.download(url=url, output=str(zip_path), quiet=False, fuzzy=True)
@@ -70,10 +60,24 @@ def safe_unzip(
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-        for p in Path(tmp).iterdir():           # preserve inner structure
+        # move everything inside the tmp dir to target
+        for p in Path(tmp).iterdir():
             shutil.move(str(p), target)
 
-    os.remove(zip_path)
+    zip_path.unlink(missing_ok=True)
+
+
+def find_model_root(base: Path, required_files: list[str]) -> Path:
+    """
+    Recursively search `base` for a directory that contains *all* `required_files`.
+    Returns that directory (may be `base` itself).
+    """
+    for root, dirs, files in os.walk(base):
+        if all(f in files for f in required_files):
+            return Path(root)
+    raise FileNotFoundError(
+        f"Could not locate {required_files} under {base} (archive layout unexpected)."
+    )
 
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
@@ -85,60 +89,48 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
         return data
     return np.frombuffer(blob, np.int16)
 
+
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
-    """Offline loader that mimics `SNAC.from_pretrained` without Hub calls."""
+    """Offline loader that never touches HuggingFace Hub."""
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"SNAC config not found: {cfg_path}")
-
     cfg     = SnacConfig(**json.loads(cfg_path.read_text()))
     vocoder = SNAC(cfg)
     ckpt    = model_dir / cfg.checkpoint
     vocoder.load_state_dict(torch.load(ckpt, map_location=device))
     return vocoder.to(device).eval()
 
+
 def load_models() -> None:
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
 
-    # ── download / unzip once ───────────────────────────────────
-    safe_unzip(
-        MODELS_DIR / "whisper.zip",
-        ASR_MODEL_PATH,
-        MODEL_URLS["whisper.zip"],
-        must_have=["config.json", "preprocessor_config.json"],
-    )
-    safe_unzip(
-        MODELS_DIR / "m2m100.zip",
-        MT_MODEL_PATH,
-        MODEL_URLS["m2m100.zip"],
-        must_have=["config.json"],
-    )
-    safe_unzip(
-        MODELS_DIR / "orpheus.zip",
-        TTS_MODEL_PATH,
-        MODEL_URLS["orpheus.zip"],
-        must_have=["config.json"],
-    )
+    # ── download / unzip (only first run) ───────────────────────
+    safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_DIR, MODEL_URLS["whisper.zip"])
+    safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_DIR,  MODEL_URLS["m2m100.zip"])
+    safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_DIR, MODEL_URLS["orpheus.zip"])
+
+    # ── figure out real roots (handle extra wrapper folders) ────
+    whisper_root = find_model_root(ASR_MODEL_DIR, ["config.json", "preprocessor_config.json"])
+    mt_root      = find_model_root(MT_MODEL_DIR,  ["config.json"])
+    # acoustic / vocoder remain the same but may be nested too
+    ac_root      = find_model_root(TTS_MODEL_DIR, ["config.json"])
+    vc_root      = find_model_root(TTS_MODEL_DIR / "vocoder", ["config.json"])
 
     # ── Whisper (ASR) ───────────────────────────────────────────
-    asr_processor = AutoProcessor.from_pretrained(ASR_MODEL_PATH, local_files_only=True)
+    asr_processor = AutoProcessor.from_pretrained(whisper_root, local_files_only=True)
     asr_model     = AutoModelForSpeechSeq2Seq.from_pretrained(
-        ASR_MODEL_PATH, torch_dtype=torch.float16, device_map="auto"
+        whisper_root, torch_dtype=torch.float16, device_map="auto"
     )
 
     # ── M2M-100 (MT) ────────────────────────────────────────────
-    mt_tokenizer = AutoTokenizer.from_pretrained(MT_MODEL_PATH, local_files_only=True)
+    mt_tokenizer = AutoTokenizer.from_pretrained(mt_root, local_files_only=True)
     mt_model     = M2M100ForConditionalGeneration.from_pretrained(
-        MT_MODEL_PATH, device_map="auto"
+        mt_root, device_map="auto"
     )
 
     # ── Orpheus (TTS) ───────────────────────────────────────────
-    ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():                      # flattened layout
-        ac_root = TTS_MODEL_PATH
-    vc_root = TTS_MODEL_PATH / "vocoder"
-
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
         ac_root, torch_dtype="auto"
@@ -157,7 +149,7 @@ async def _startup() -> None:
     load_models()
     print("✅ Models loaded — server ready")
 
-# ─────────── WebSocket ──────────────────────────────────────────
+# ─────────── WebSocket — same as before ─────────────────────────
 PING_EVERY = 25  # seconds
 
 @app.websocket("/translate")
@@ -169,14 +161,13 @@ async def translate(ws: WebSocket):
         while True:
             await asyncio.sleep(PING_EVERY)
             try:
-                await ws.send_bytes(b"\x00")  # 1-byte ping
+                await ws.send_bytes(b"\x00")
             except Exception:
                 break
     asyncio.create_task(keep_alive())
 
     try:
         while True:
-            # ── receive mic chunk or close ───────────────────────
             try:
                 chunk = await asyncio.wait_for(ws.receive_bytes(), timeout=PING_EVERY + 5)
                 pcm_buffer.extend(chunk)
@@ -188,31 +179,27 @@ async def translate(ws: WebSocket):
             if not pcm_buffer:
                 continue
 
-            # ── ASR ──────────────────────────────────────────────
-            pcm16 = wav_to_pcm16(bytes(pcm_buffer)).astype(np.float32) / 32768.0
-            feats = asr_processor(
-                pcm16, sampling_rate=16_000, return_tensors="pt"
-            ).input_features.to(asr_model.device).half()
+            # ── ASR ──────────────────────────────────────────
+            pcm16  = wav_to_pcm16(bytes(pcm_buffer)).astype(np.float32) / 32768.0
+            feats  = asr_processor(pcm16, sampling_rate=16_000, return_tensors="pt")\
+                        .input_features.to(asr_model.device).half()
             with torch.inference_mode():
-                txt_ids = asr_model.generate(feats)
-            fr = asr_processor.batch_decode(txt_ids, skip_special_tokens=True)[0].strip()
+                ids = asr_model.generate(feats)
+            fr = asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
 
-            # ── MT ───────────────────────────────────────────────
+            # ── MT ───────────────────────────────────────────
             mt_tokenizer.src_lang = "fr"
-            enc = mt_tokenizer(fr, return_tensors="pt").to(mt_model.device)
-            bos = mt_tokenizer.get_lang_id("lg")
+            enc  = mt_tokenizer(fr, return_tensors="pt").to(mt_model.device)
+            bos  = mt_tokenizer.get_lang_id("lg")
             with torch.inference_mode():
-                trg_ids = mt_model.generate(**enc, forced_bos_token_id=bos)
-            lg = mt_tokenizer.batch_decode(trg_ids, skip_special_tokens=True)[0]
+                out = mt_model.generate(**enc, forced_bos_token_id=bos)
+            lg = mt_tokenizer.batch_decode(out, skip_special_tokens=True)[0]
 
-            # ── send texts immediately (UI) ─────────────────────
             await ws.send_text(json.dumps({"fr": fr, "lg": lg}))
 
-            # ── TTS ─────────────────────────────────────────────
-            prompt = (
-                f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>"
-                f"{lg}{tts_tokenizer.eos_token}<|audio|>"
-            )
+            # ── TTS ──────────────────────────────────────────
+            prompt   = f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}" \
+                       f"{tts_tokenizer.eos_token}<|audio|>"
             token_in = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
             with torch.inference_mode():
@@ -222,24 +209,20 @@ async def translate(ws: WebSocket):
                     pad_token_id=tts_tokenizer.pad_token_id,
                     eos_token_id=tts_tokenizer.eos_token_id,
                 )
-                diff = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
+                diff = [t - 128266 - ((i % 7) * 4096)
+                        for i, t in enumerate(llm[0][token_in.shape[-1]:])]
                 diff = diff[: (len(diff) // 7) * 7]
                 tracks = [[], [], []]
                 for i in range(0, len(diff), 7):
-                    f = diff[i : i + 7]
+                    f = diff[i:i+7]
                     if any(not 0 <= c < 4096 for c in f):
                         continue
                     tracks[0].append(f[0])
                     tracks[1].extend([f[1], f[4]])
                     tracks[2].extend([f[2], f[3], f[5], f[6]])
-                codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0) for t in tracks]
-                wav = (
-                    tts_vocoder.decode(codes)      # (1, C, T)
-                    .squeeze(0)
-                    .cpu()
-                    .numpy()
-                    .T                             # (T, C)
-                )
+                codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
+                         for t in tracks]
+                wav = tts_vocoder.decode(codes).squeeze(0).cpu().numpy().T
 
             buf = io.BytesIO()
             sf.write(buf, wav, 16_000, format="WAV", subtype="PCM_16")
