@@ -55,23 +55,37 @@ def load_models():
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
 
-    safe_unzip(MODELS_DIR/"whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
-    safe_unzip(MODELS_DIR/"m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
-    safe_unzip(MODELS_DIR/"orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
+    # ── download / unzip once ───────────────────────────────────
+    safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
+    safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
+    safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
 
+    # ── Whisper (ASR) ───────────────────────────────────────────
     asr_processor = AutoProcessor.from_pretrained(ASR_MODEL_PATH, local_files_only=True)
     asr_model     = AutoModelForSpeechSeq2Seq.from_pretrained(
-        ASR_MODEL_PATH, torch_dtype=torch.float16, device_map="auto")
+        ASR_MODEL_PATH, torch_dtype=torch.float16, device_map="auto"
+    )
 
-    mt_tokenizer  = AutoTokenizer.from_pretrained(MT_MODEL_PATH, local_files_only=True)
-    mt_model      = M2M100ForConditionalGeneration.from_pretrained(MT_MODEL_PATH, device_map="auto")
+    # ── M2M-100 (MT) ────────────────────────────────────────────
+    mt_tokenizer  = AutoTokenizer.from_pretrained(MT_MODEL_PATH,  local_files_only=True)
+    mt_model      = M2M100ForConditionalGeneration.from_pretrained(
+        MT_MODEL_PATH, device_map="auto"
+    )
 
-    ac, vc = TTS_MODEL_PATH / "acoustic_model", TTS_MODEL_PATH / "vocoder"
-    tts_tokenizer      = AutoTokenizer.from_pretrained(ac, local_files_only=True)
-    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac, torch_dtype="auto").to(DEVICE).eval()
-    tts_vocoder        = SNAC.from_pretrained(vc, local_files_only=True).to(DEVICE).eval()
+    # ── Orpheus (TTS) ───────────────────────────────────────────
+    # pick acoustic_model folder if it exists, else use bundle root
+    ac_root = TTS_MODEL_PATH / "acoustic_model"
+    if not ac_root.exists():                  # flattened layout after safe_unzip
+        ac_root = TTS_MODEL_PATH              # files live at bundle root
+    vc_root = TTS_MODEL_PATH / "vocoder"
 
-    # Performance knobs
+    tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
+    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
+        ac_root, torch_dtype="auto"
+    ).to(DEVICE).eval()
+    tts_vocoder        = SNAC.from_pretrained(vc_root, local_files_only=True).to(DEVICE).eval()
+
+    # ── Performance knobs ───────────────────────────────────────
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
