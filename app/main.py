@@ -47,20 +47,31 @@ tts_acoustic_model = tts_tokenizer = tts_vocoder = None
 app = FastAPI()
 
 # ─────────── Helpers ────────────────────────────────────────────
-def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
-    if target.exists() and any(target.iterdir()):
-        return                                   # already unpacked
+def safe_unzip(
+    zip_path: Path,
+    target:   Path,
+    url:      str,
+    must_have: list[str],
+) -> None:
+    """
+    Download `url` once and unzip into `target`, but only skip when **all**
+    `must_have` files are already present.  If the folder is incomplete it is
+    wiped and re-downloaded.
+    """
+    if target.exists() and all((target / f).exists() for f in must_have):
+        return                                  # already have everything
 
+    if target.exists():
+        shutil.rmtree(target)                   # purge half-baked folder
     target.mkdir(parents=True, exist_ok=True)
+
     gdown.download(url=url, output=str(zip_path), quiet=False, fuzzy=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-
-        # move *everything* that was inside the zip, preserving structure
-        for p in Path(tmp).iterdir():
-            shutil.move(str(p), target)          # p may be a dir or file
+        for p in Path(tmp).iterdir():           # preserve inner structure
+            shutil.move(str(p), target)
 
     os.remove(zip_path)
 
@@ -75,16 +86,14 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, np.int16)
 
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
-    """
-    Offline loader that mimics `SNAC.from_pretrained` but never calls the Hub.
-    """
+    """Offline loader that mimics `SNAC.from_pretrained` without Hub calls."""
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"SNAC config not found: {cfg_path}")
 
-    cfg      = SnacConfig(**json.loads(cfg_path.read_text()))
-    vocoder  = SNAC(cfg)
-    ckpt     = model_dir / cfg.checkpoint
+    cfg     = SnacConfig(**json.loads(cfg_path.read_text()))
+    vocoder = SNAC(cfg)
+    ckpt    = model_dir / cfg.checkpoint
     vocoder.load_state_dict(torch.load(ckpt, map_location=device))
     return vocoder.to(device).eval()
 
@@ -93,9 +102,24 @@ def load_models() -> None:
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
 
     # ── download / unzip once ───────────────────────────────────
-    safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
-    safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
-    safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
+    safe_unzip(
+        MODELS_DIR / "whisper.zip",
+        ASR_MODEL_PATH,
+        MODEL_URLS["whisper.zip"],
+        must_have=["config.json", "preprocessor_config.json"],
+    )
+    safe_unzip(
+        MODELS_DIR / "m2m100.zip",
+        MT_MODEL_PATH,
+        MODEL_URLS["m2m100.zip"],
+        must_have=["config.json"],
+    )
+    safe_unzip(
+        MODELS_DIR / "orpheus.zip",
+        TTS_MODEL_PATH,
+        MODEL_URLS["orpheus.zip"],
+        must_have=["config.json"],
+    )
 
     # ── Whisper (ASR) ───────────────────────────────────────────
     asr_processor = AutoProcessor.from_pretrained(ASR_MODEL_PATH, local_files_only=True)
@@ -111,12 +135,14 @@ def load_models() -> None:
 
     # ── Orpheus (TTS) ───────────────────────────────────────────
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():                       # flattened layout
+    if not ac_root.exists():                      # flattened layout
         ac_root = TTS_MODEL_PATH
     vc_root = TTS_MODEL_PATH / "vocoder"
 
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
-    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto").to(DEVICE).eval()
+    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
+        ac_root, torch_dtype="auto"
+    ).to(DEVICE).eval()
     tts_vocoder        = load_snac_local(vc_root, DEVICE)
 
     # ── Performance knobs ───────────────────────────────────────
@@ -183,7 +209,10 @@ async def translate(ws: WebSocket):
             await ws.send_text(json.dumps({"fr": fr, "lg": lg}))
 
             # ── TTS ─────────────────────────────────────────────
-            prompt   = f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{lg}{tts_tokenizer.eos_token}<|audio|>"
+            prompt = (
+                f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>"
+                f"{lg}{tts_tokenizer.eos_token}<|audio|>"
+            )
             token_in = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
             with torch.inference_mode():
@@ -193,9 +222,8 @@ async def translate(ws: WebSocket):
                     pad_token_id=tts_tokenizer.pad_token_id,
                     eos_token_id=tts_tokenizer.eos_token_id,
                 )
-
-                diff   = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
-                diff   = diff[: (len(diff) // 7) * 7]
+                diff = [t - 128266 - ((i % 7) * 4096) for i, t in enumerate(llm[0][token_in.shape[-1]:])]
+                diff = diff[: (len(diff) // 7) * 7]
                 tracks = [[], [], []]
                 for i in range(0, len(diff), 7):
                     f = diff[i : i + 7]
@@ -205,14 +233,12 @@ async def translate(ws: WebSocket):
                     tracks[1].extend([f[1], f[4]])
                     tracks[2].extend([f[2], f[3], f[5], f[6]])
                 codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0) for t in tracks]
-
                 wav = (
-                    tts_vocoder.decode(codes)  # (1, C, T)
+                    tts_vocoder.decode(codes)      # (1, C, T)
                     .squeeze(0)
-                    .detach()
                     .cpu()
                     .numpy()
-                    .T                          # (T, C)
+                    .T                             # (T, C)
                 )
 
             buf = io.BytesIO()
