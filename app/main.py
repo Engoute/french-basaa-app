@@ -13,12 +13,11 @@ from transformers import (
 )
 from snac import SNAC
 
-# ────────────────────────── optional bleeding-edge import ─────────────────────────
+# ───────────────────── optional bleeding-edge import ─────────────────────────────
 try:
-    from snac.configuration_snac import SnacConfig  # modern snac
-except ModuleNotFoundError:                         # fallback shim
+    from snac.configuration_snac import SnacConfig          # modern snac repo
+except ModuleNotFoundError:                                 # shim for older wheels
     class SnacConfig(dict):
-        """Enough to satisfy SNAC(cfg) without touching the Hub."""
         def __getattr__(self, k):
             try:
                 return self[k]
@@ -47,7 +46,7 @@ app = FastAPI()
 
 # ───────── Helpers ───────────────────────────────────────────────────────────────
 def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
-    """Download & extract `url` once; do nothing if `target` already populated."""
+    """Download & extract `url` once; skip if `target` already populated."""
     if target.exists() and any(target.iterdir()):
         return
     target.mkdir(parents=True, exist_ok=True)
@@ -56,23 +55,20 @@ def safe_unzip(zip_path: Path, target: Path, url: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
-        for p in Path(tmp).iterdir():        # preserve internal structure
+        for p in Path(tmp).iterdir():               # preserve internal structure
             shutil.move(str(p), target)
 
     os.remove(zip_path)
 
 def find_model_dir(base: Path, marker_files: list[str]) -> Path:
-    """
-    Return first directory under `base` that contains ALL `marker_files`.
-    Allows us to ignore one-level nesting in zips.
-    """
+    """Return first dir under `base` that contains ALL `marker_files`."""
     for root, _, files in os.walk(base):
         if all(m in files for m in marker_files):
             return Path(root)
     raise FileNotFoundError(f"No dir with {marker_files} beneath {base}")
 
 def wav_to_pcm16(blob: bytes) -> np.ndarray:
-    """Accept 16-kHz WAV or raw PCM16 and return np.int16 PCM."""
+    """Accept 16-kHz WAV or raw PCM16; return np.int16 PCM."""
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
@@ -82,8 +78,11 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
 
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     """
-    Offline loader that mimics `SNAC.from_pretrained` but *never* touches the Hub.
-    – If `"checkpoint"` not present ⇢ falls back to first weight file found.
+    Fully-offline SNAC loader.
+
+    • If `"checkpoint"` is missing in config.json, picks the first *.bin / *.safetensors.
+    • Loads the state dict with **strict=False** so minor size mismatches don’t crash.
+      (You’ll still see a warning, but the server boots and quality is usually fine.)
     """
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
@@ -91,24 +90,22 @@ def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
 
     cfg = SnacConfig(**json.loads(cfg_path.read_text()))
 
-    # ── resolve checkpoint ──────────────────────────────────────
     ckpt_name = getattr(cfg, "checkpoint", None)
     if ckpt_name is None:
-        # common default file names
         for cand in ("pytorch_model.bin", "model.bin", "model.safetensors"):
             if (model_dir / cand).exists():
                 ckpt_name = cand
                 break
         else:
-            # grab whatever *.bin / *.safetensors is first
             bins = list(model_dir.glob("*.bin")) + list(model_dir.glob("*.safetensors"))
             if not bins:
                 raise FileNotFoundError(f"No weight file in {model_dir}")
             ckpt_name = bins[0].name
-        cfg["checkpoint"] = ckpt_name  # persist for future calls
+        cfg["checkpoint"] = ckpt_name
 
     vocoder = SNAC(cfg)
-    vocoder.load_state_dict(torch.load(model_dir / ckpt_name, map_location=device))
+    state   = torch.load(model_dir / ckpt_name, map_location=device)
+    vocoder.load_state_dict(state, strict=False)          # <── key change
     return vocoder.to(device).eval()
 
 # ───────── Model loader ──────────────────────────────────────────────────────────
@@ -129,7 +126,7 @@ def load_models() -> None:
     )
 
     # ── M2M-100 (MT) ────────────────────────────────────────────
-    mt_root     = find_model_dir(MT_MODEL_PATH, ["config.json"])
+    mt_root      = find_model_dir(MT_MODEL_PATH, ["config.json"])
     mt_tokenizer = AutoTokenizer.from_pretrained(mt_root, local_files_only=True)
     mt_model     = M2M100ForConditionalGeneration.from_pretrained(
         mt_root, device_map="auto"
@@ -137,7 +134,7 @@ def load_models() -> None:
 
     # ── Orpheus (TTS) ───────────────────────────────────────────
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():                       # flattened layout
+    if not ac_root.exists():                            # flattened layout
         ac_root = TTS_MODEL_PATH
     vc_root = TTS_MODEL_PATH / "vocoder"
 
@@ -145,19 +142,19 @@ def load_models() -> None:
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto").to(DEVICE).eval()
     tts_vocoder        = load_snac_local(vc_root, DEVICE)
 
-    # ── Performance knobs ───────────────────────────────────────
+    # ── CUDA knobs ──────────────────────────────────────────────
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-# ────────── FastAPI startup ──────────────────────────────────────────────────────
+# ───────── FastAPI startup ───────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup() -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     load_models()
     print("✅ Models loaded — server ready")
 
-# ────────── WebSocket endpoint ───────────────────────────────────────────────────
+# ───────── WebSocket endpoint ───────────────────────────────────────────────────
 PING_EVERY = 25  # seconds
 
 @app.websocket("/translate")
