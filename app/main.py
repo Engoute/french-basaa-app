@@ -72,19 +72,22 @@ def load_models():
         MT_MODEL_PATH, device_map="auto"
     )
 
-        # ── Orpheus (TTS) ───────────────────────────────────────────
+    # ── Orpheus (TTS) ───────────────────────────────────────────
+    # pick acoustic_model folder if it exists, else use bundle root
     ac_root = TTS_MODEL_PATH / "acoustic_model"
-    if not ac_root.exists():            # flattened layout after safe_unzip
-        ac_root = TTS_MODEL_PATH
+    if not ac_root.exists():               # flattened layout after safe_unzip
+        ac_root = TTS_MODEL_PATH           # files live at bundle root
     vc_root = TTS_MODEL_PATH / "vocoder"
 
+    # acoustic side
     tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
-    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
-        ac_root, torch_dtype="auto"
-    ).to(DEVICE).eval()
+    tts_acoustic_model = (
+        AutoModelForCausalLM.from_pretrained(ac_root, torch_dtype="auto")
+        .to(DEVICE)
+        .eval()
+    )
 
-    # 👇 THIS is the two-line defensive patch
-    #    cast vc_root to str before handing it to SNAC
+    # vocoder side  (✨ defensive cast to str ✨)
     tts_vocoder = (
         SNAC.from_pretrained(str(vc_root), local_files_only=True)
             .to(DEVICE)
