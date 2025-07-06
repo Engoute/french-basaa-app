@@ -87,11 +87,15 @@ def load_models():
         .eval()
     )
 
-    # vocoder side  (✨ defensive cast to str ✨)
+        # vocoder side  (tell SNAC where the files really are)
     tts_vocoder = (
-        SNAC.from_pretrained(str(vc_root), local_files_only=True)
-            .to(DEVICE)
-            .eval()
+        SNAC.from_pretrained(
+            "local-vocoder",            # dummy repo_id that passes validation
+            local_dir=str(vc_root),     # actual folder with config.json/model.bin
+            local_files_only=True,
+        )
+        .to(DEVICE)
+        .eval()
     )
 
 
