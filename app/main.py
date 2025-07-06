@@ -1,4 +1,4 @@
-# app/main.py  – streaming + keep‑alive, fully offline
+# app/main.py – streaming + keep‑alive, fully offline
 import asyncio, io, json, os, shutil, tempfile, traceback, zipfile
 from pathlib import Path
 from typing import Optional
@@ -15,18 +15,17 @@ from transformers import (
 
 # ────────── SNAC (pinned, defensive loader) ───────────────────
 #
-# 1.  requirements.txt (or Dockerfile) must include
-#     snac @ git+https://github.com/hubertsiuzdak/snac.git@7f3d2e8
-#     ───^—— hash right before the 48→64 change.
-#
-# 2.  We still guard against future shape drifts.
+# requirements.txt must pin a 48‑channel build, e.g.
+#   snac==1.2.1
+# or
+#   snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71
 
 from snac import SNAC
 
-try:
-    from snac.configuration_snac import SnacConfig       # legacy wheels
-except ModuleNotFoundError:                              # pragma: no cover
-    class SnacConfig(dict):                              # type: ignore
+try:                                    # legacy wheels support
+    from snac.configuration_snac import SnacConfig
+except ModuleNotFoundError:             # pragma: no cover
+    class SnacConfig(dict):             # type: ignore
         def __getattr__(self, k): return self[k]
 
 # ───────────────────────── config & paths ─────────────────────
@@ -83,35 +82,29 @@ def wav_to_pcm16(blob: bytes) -> np.ndarray:
 # ─── robust SNAC loader (offline, shape‑safe) ──────────────────
 def load_snac_local(model_dir: Path, device: str = "cpu") -> SNAC:
     """
-    Load a SNAC vocoder **entirely offline** and tolerate size‑mismatch
-    between library defaults and checkpoint tensors.
+    Load a SNAC vocoder offline and tolerate any size‑mismatch between
+    library defaults and checkpoint tensors.
     """
-    # Build the model from the on‑disk config (correct dim = 48)
     cfg_path = model_dir / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing SNAC config: {cfg_path}")
     cfg = SnacConfig(**json.loads(cfg_path.read_text()))
-    voc = SNAC(**cfg).to(device)
+    voc = SNAC(**cfg).to(device)                    # ← unpack dict (correct dims)
 
-    # Load checkpoint but drop every key whose tensor shape disagrees.
     ckpt_file = model_dir / "pytorch_model.bin"
     if not ckpt_file.exists():
         raise FileNotFoundError(f"SNAC weights not found in {model_dir}")
     raw_state = torch.load(ckpt_file, map_location=device)
 
     model_state = voc.state_dict()
-    compatible = {
-        k: v for k, v in raw_state.items()
-        if k in model_state and v.shape == model_state[k].shape
-    }
+    compatible = {k: v for k, v in raw_state.items()
+                  if k in model_state and v.shape == model_state[k].shape}
     dropped = [k for k in raw_state.keys() if k not in compatible]
     if dropped:
-        print(f"ℹ️  Dropped {len(dropped)} unmatched SNAC weights "
-              f"(library vs checkpoint size drift).")
+        print(f"ℹ️  Dropped {len(dropped)} unmatched SNAC weights.")
     voc.load_state_dict(compatible, strict=False)
     voc.eval()
-    print(f"✅  SNAC vocoder ready  | cfg: {cfg_path.name} | "
-          f"ckpt: {ckpt_file.name}")
+    print(f"✅  SNAC vocoder ready | cfg: {cfg_path.name} | ckpt: {ckpt_file.name}")
     return voc
 
 # ────────── model bootstrap (runs once) ────────────────────────
@@ -139,14 +132,15 @@ def load_models() -> None:
     ac_root = resolve_model_dir(TTS_MODEL_PATH / "acoustic_model")
     vc_root = resolve_model_dir(TTS_MODEL_PATH / "vocoder")
 
-    tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
+    tts_tokenizer = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
-        ac_root, torch_dtype="auto", attn_implementation="flash_attention_2"
+        ac_root, torch_dtype="auto"          # ← flash‑attention removed
     ).to(DEVICE).eval()
-    tts_vocoder        = load_snac_local(vc_root, DEVICE)
+    tts_vocoder = load_snac_local(vc_root, DEVICE)
 
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.matmul.allow_tf32 = True
+    # Enable PyTorch SDPA and TF32‑matmul (does not require flash‑attn pkg)
+    torch.backends.cuda.enable_flash_sdp(True)     # comment out if undesired
+    torch.backends.cuda.matmul.allow_tf32 = True   # comment out if undesired
     torch.set_float32_matmul_precision("high")
 
 # ────────── startup hook ───────────────────────────────────────
@@ -158,9 +152,9 @@ async def _startup() -> None:
 
 # ────────── streaming websocket (unchanged) ────────────────────
 FRAME_MS         = 100
-TRIGGER_DURATION = 0.9   # s of speech before we start ASR
-SILENCE_TIMEOUT  = 0.30  # s
-PING_INTERVAL    = 15    # s
+TRIGGER_DURATION = 0.9   # seconds of speech before ASR starts
+SILENCE_TIMEOUT  = 0.30  # seconds
+PING_INTERVAL    = 15    # seconds
 
 @app.websocket("/translate")
 async def translate(ws: WebSocket):
