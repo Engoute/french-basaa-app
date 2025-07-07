@@ -1,4 +1,4 @@
-# app/main.py – streaming + keep‑alive (explicit "DONE" cue, no VAD timers)
+# app/main.py – streaming + keep-alive (explicit "DONE" cue, no VAD timers)
 import asyncio, io, json, os, shutil, tempfile, zipfile
 from pathlib import Path
 
@@ -13,8 +13,8 @@ from transformers import (
 )
 
 # ══════════════════════════════════════════════════════════════
-# SNAC loader (pinned to 48‑channel build)
-#   requirements.txt → snac==1.2.1  or  snac @git+…@<48‑ch‑commit>
+# SNAC loader (pinned to 48-channel build)
+#   requirements.txt → snac==1.2.1  or  snac @ git+…@<48-ch-commit>
 # ══════════════════════════════════════════════════════════════
 from snac import SNAC
 try:
@@ -62,7 +62,7 @@ def wav_to_int16(blob: bytes) -> np.ndarray:
     if blob[:4] == b"RIFF":
         data, sr = sf.read(io.BytesIO(blob), dtype="int16")
         if sr != 16_000:
-            raise ValueError("expected 16 kHz WAV")
+            raise ValueError("expected 16 kHz WAV")
         return data
     return np.frombuffer(blob, np.int16)
 
@@ -112,7 +112,9 @@ async def _startup() -> None:
     load_models()
     print("🌟 models in VRAM, server ready")
 
-# ───────── WebSocket endpoint ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  Web-Socket 1 :  /translate          (voice pipeline – unchanged)
+# ══════════════════════════════════════════════════════════════
 PING_INTERVAL = 15  # seconds
 
 @app.websocket("/translate")
@@ -137,7 +139,7 @@ async def translate(ws: WebSocket):
             if msg["type"] == "websocket.disconnect":
                 return  # stop immediately, no further receive() allowed
 
-            # ➋ explicit end‑of‑speech cue
+            # ➋ explicit end-of-speech cue
             if "text" in msg and msg["text"]:
                 if msg["text"] == "DONE":
                     break
@@ -209,3 +211,28 @@ async def translate(ws: WebSocket):
         await ws.send_bytes(buf.getvalue())
 
     await ws.close()
+
+# ══════════════════════════════════════════════════════════════
+#  Web-Socket 2 :  /translate_text   (text-only FR → Basaa)
+# ══════════════════════════════════════════════════════════════
+@app.websocket("/translate_text")
+async def translate_text(ws: WebSocket):
+    """Receive one French string, send one Basaa string, close."""
+    await ws.accept()
+
+    try:
+        fr = await ws.receive_text()          # single text frame
+
+        mt_tokenizer.src_lang = "fr"
+        enc = mt_tokenizer(fr, return_tensors="pt").to(mt_model.device)
+        bos = mt_tokenizer.get_lang_id("lg")
+        with torch.inference_mode():
+            out_ids = mt_model.generate(**enc, forced_bos_token_id=bos)
+        bas = mt_tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0]
+
+        await ws.send_text(bas)
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await ws.close()
