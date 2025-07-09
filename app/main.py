@@ -199,7 +199,7 @@ async def translate(ws: WebSocket):
 
     with torch.inference_mode():
         gen = tts_acoustic_model.generate(
-            in_ids, max_new_tokens=3000,  # few‑shot prompt already in input
+            in_ids, max_new_tokens=9000,  # few‑shot prompt already in input
             pad_token_id=tts_tokenizer.pad_token_id,
             eos_token_id=tts_tokenizer.eos_token_id,
         )
