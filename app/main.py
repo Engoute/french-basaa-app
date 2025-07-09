@@ -4,6 +4,7 @@ from pathlib import Path
 
 import gdown, numpy as np, soundfile as sf, torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed  # ← new import
 from transformers import (
     AutoModelForSpeechSeq2Seq, AutoModelForCausalLM,
     AutoProcessor, AutoTokenizer, M2M100ForConditionalGeneration,
@@ -231,7 +232,11 @@ async def translate(ws: WebSocket):
     buf = io.BytesIO()
     sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
     await ws.send_bytes(buf.getvalue())
-
+    try:
+        await ws.send_bytes(buf.getvalue())
+    except (WebSocketDisconnect, ConnectionClosed):
+        # client hung up happily after closing frame – nothing to do
+        return
 
 # ══════════════════════════════════════════════════════════════
 #  Web‑Socket 2 :  /translate_text   (text‑only FR → Basaa)
