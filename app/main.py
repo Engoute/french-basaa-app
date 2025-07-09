@@ -1,29 +1,23 @@
-# app/main.py – streaming + keep-alive (explicit "DONE" cue, no VAD timers)
-import asyncio, io, json, os, shutil, tempfile, zipfile
+# app/main.py  –  streaming + keep‑alive  ●  2025‑07‑09
+import asyncio, io, json, os, shutil, tempfile, zipfile, time
 from pathlib import Path
 
 import gdown, numpy as np, soundfile as sf, torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from transformers import (
-    AutoModelForSpeechSeq2Seq,
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    M2M100ForConditionalGeneration,
+    AutoModelForSpeechSeq2Seq, AutoModelForCausalLM,
+    AutoProcessor, AutoTokenizer, M2M100ForConditionalGeneration,
 )
 
-# ══════════════════════════════════════════════════════════════
-# SNAC loader (pinned to 48-channel build)
-#   requirements.txt → snac==1.2.1  or  snac @ git+…@<48-ch-commit>
-# ══════════════════════════════════════════════════════════════
+# ═══ SNAC loader (pinned 48‑ch) ═══════════════════════════════
 from snac import SNAC
 try:
-    from snac.configuration_snac import SnacConfig          # legacy wheels
+    from snac.configuration_snac import SnacConfig          # legacy wheel
 except ModuleNotFoundError:
     class SnacConfig(dict):                                 # type: ignore
         def __getattr__(self, k): return self[k]
 
-# ───────── paths & URLs ───────────────────────────────────────
+# ─── paths ────────────────────────────────────────────────────
 MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
 ASR_MODEL_PATH = MODELS_DIR / "whisper_fr_inference_v1"
 MT_MODEL_PATH  = MODELS_DIR / "m2m100_basaa_inference_v1"
@@ -36,13 +30,13 @@ MODEL_URLS = {
     "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
 }
 
-# ───────── globals ────────────────────────────────────────────
+# ─── globals ──────────────────────────────────────────────────
 asr_model = asr_processor = mt_model = mt_tokenizer = None
 tts_acoustic_model = tts_tokenizer = tts_vocoder = None
 
 app = FastAPI()
 
-# ───────── helpers ────────────────────────────────────────────
+# ─── helpers ──────────────────────────────────────────────────
 def safe_unzip(zip_path: Path, dst_dir: Path, url: str) -> None:
     if dst_dir.exists() and any(dst_dir.iterdir()):
         return
@@ -77,7 +71,24 @@ def load_snac(model_dir: Path, device="cpu") -> SNAC:
     print("✅  SNAC loaded")
     return voc
 
-# ───────── model bootstrap ────────────────────────────────────
+# ─── optimisation helpers ────────────────────────────────────
+def whisper_chunks(pcm_f32: np.ndarray, sr=16_000,
+                   win_s=25, hop_s=23):               # 2 s overlap
+    step = hop_s * sr
+    win  =  win_s * sr
+    for off in range(0, len(pcm_f32), step):
+        yield pcm_f32[off : off + win]
+
+def fast_generate_whisper(feats):
+    return asr_model.generate(
+        feats,
+        do_sample=False,
+        num_beams=1,
+        max_new_tokens=448,             # 30 s context
+        length_penalty=1.0,
+    )
+
+# ─── model bootstrap ─────────────────────────────────────────
 def load_models() -> None:
     global asr_model, asr_processor, mt_model, mt_tokenizer
     global tts_acoustic_model, tts_tokenizer, tts_vocoder
@@ -113,7 +124,7 @@ async def _startup() -> None:
     print("🌟 models in VRAM, server ready")
 
 # ══════════════════════════════════════════════════════════════
-#  Web-Socket 1 :  /translate          (voice pipeline – unchanged)
+#  Web‑Socket 1 :  /translate   (voice pipeline)
 # ══════════════════════════════════════════════════════════════
 PING_INTERVAL = 15  # seconds
 
@@ -135,17 +146,14 @@ async def translate(ws: WebSocket):
         while True:
             msg = await ws.receive()
 
-            # ➊ client closed socket
             if msg["type"] == "websocket.disconnect":
-                return  # stop immediately, no further receive() allowed
+                return
 
-            # ➋ explicit end-of-speech cue
             if "text" in msg and msg["text"]:
                 if msg["text"] == "DONE":
                     break
-                continue  # ignore any other text
+                continue
 
-            # ➌ skip events with no binary payload
             if "bytes" not in msg or msg["bytes"] is None:
                 continue
 
@@ -154,35 +162,42 @@ async def translate(ws: WebSocket):
     except WebSocketDisconnect:
         return
 
-    # ───── ASR --------------------------------------------------
+    # ───── ASR (chunked, overlapped) ───────────────────────────
     if not pcm_chunks:
         await ws.close(code=4000, reason="no audio")
         return
 
-    pcm = np.concatenate(pcm_chunks).astype(np.float32) / 32768.0
-    feats = asr_processor(pcm, sampling_rate=16_000,
-                          return_tensors="pt").input_features.to(asr_model.device).half()
-    with torch.inference_mode():
-        ids = asr_model.generate(feats)
-    fr = asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+    t0 = time.perf_counter()
 
-    # ───── MT ---------------------------------------------------
+    pcm_f32 = (np.concatenate(pcm_chunks).astype(np.float32) / 32768.0)
+    fr_parts = []
+    for ch in whisper_chunks(pcm_f32):           # ≤ 25 s each
+        feats = asr_processor(ch, sampling_rate=16_000,
+                              return_tensors="pt").input_features.to(asr_model.device).half()
+        with torch.inference_mode():
+            ids = fast_generate_whisper(feats)
+        fr_parts.append(asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip())
+    fr = " ".join(fr_parts).strip()
+
+    # ───── MT ──────────────────────────────────────────────────
     mt_tokenizer.src_lang = "fr"
     enc = mt_tokenizer(fr, return_tensors="pt").to(mt_model.device)
     bos = mt_tokenizer.get_lang_id("lg")
     with torch.inference_mode():
-        out_ids = mt_model.generate(**enc, forced_bos_token_id=bos)
+        out_ids = mt_model.generate(
+            **enc, forced_bos_token_id=bos, max_new_tokens=512, num_beams=2)
     bas = mt_tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0]
 
     await ws.send_text(json.dumps({"fr": fr, "lg": bas}))
 
-    # ───── TTS --------------------------------------------------
-    prompt = (f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker<|text|>{bas}"
-              f"{tts_tokenizer.eos_token}<|audio|>")
+    # ───── TTS (acoustic + vocoder) ────────────────────────────
+    prompt = (f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker"
+              f"<|text|>{bas}{tts_tokenizer.eos_token}<|audio|>")
     in_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+
     with torch.inference_mode():
         gen = tts_acoustic_model.generate(
-            in_ids, max_new_tokens=4000,
+            in_ids, max_new_tokens=3000,  # few‑shot prompt already in input
             pad_token_id=tts_tokenizer.pad_token_id,
             eos_token_id=tts_tokenizer.eos_token_id,
         )
@@ -211,27 +226,23 @@ async def translate(ws: WebSocket):
         await ws.send_bytes(buf.getvalue())
 
     await ws.close()
+    print(f"⏱  voice pipeline {time.perf_counter()-t0:.2f}s")
 
 # ══════════════════════════════════════════════════════════════
-#  Web-Socket 2 :  /translate_text   (text-only FR → Basaa)
+#  Web‑Socket 2 :  /translate_text   (text‑only FR → Basaa)
 # ══════════════════════════════════════════════════════════════
 @app.websocket("/translate_text")
 async def translate_text(ws: WebSocket):
-    """Receive one French string, send one Basaa string, close."""
     await ws.accept()
-
     try:
-        fr = await ws.receive_text()          # single text frame
-
+        fr = await ws.receive_text()
         mt_tokenizer.src_lang = "fr"
         enc = mt_tokenizer(fr, return_tensors="pt").to(mt_model.device)
         bos = mt_tokenizer.get_lang_id("lg")
         with torch.inference_mode():
-            out_ids = mt_model.generate(**enc, forced_bos_token_id=bos)
-        bas = mt_tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0]
-
+            ids = mt_model.generate(**enc, forced_bos_token_id=bos)
+        bas = mt_tokenizer.batch_decode(ids, skip_special_tokens=True)[0]
         await ws.send_text(bas)
-
     except WebSocketDisconnect:
         pass
     finally:
