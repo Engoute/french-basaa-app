@@ -196,18 +196,20 @@ async def translate(ws: WebSocket):
     prompt = (f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker"
               f"<|text|>{bas}{tts_tokenizer.eos_token}<|audio|>")
     in_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-
-    with torch.inference_mode():
-        gen = tts_acoustic_model.generate(
-            in_ids, max_new_tokens=9000,  # few‑shot prompt already in input
-            pad_token_id=tts_tokenizer.pad_token_id,
-            eos_token_id=tts_tokenizer.eos_token_id,
-        )
-
+    
+    # 1) acoustic model  – off‑load to thread so event‑loop can answer pings
+    gen = await asyncio.to_thread(
+        tts_acoustic_model.generate,
+        in_ids,
+        max_new_tokens=9000,
+        pad_token_id=tts_tokenizer.pad_token_id,
+        eos_token_id=tts_tokenizer.eos_token_id,
+    )
+    
     tail = gen[0][in_ids.shape[-1]:].tolist()
     raw  = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
     raw  = raw[: (len(raw) // 7) * 7]
-
+    
     tracks = [[], [], []]
     for i in range(0, len(raw), 7):
         f = raw[i : i + 7]
@@ -216,19 +218,20 @@ async def translate(ws: WebSocket):
         tracks[0].append(f[0])
         tracks[1].extend([f[1], f[4]])
         tracks[2].extend([f[2], f[3], f[5], f[6]])
-
+    
     if tracks[0]:
         codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
                  for t in tracks]
-        with torch.inference_mode():
-            wav = tts_vocoder.decode(codes).cpu().numpy().squeeze()
 
-        buf = io.BytesIO()
-        sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
-        await ws.send_bytes(buf.getvalue())
+    # 2) vocoder decode  – same trick
+    wav = await asyncio.to_thread(
+        lambda: tts_vocoder.decode(codes).cpu().numpy().squeeze()
+    )
 
-    await ws.close()
-    print(f"⏱  voice pipeline {time.perf_counter()-t0:.2f}s")
+    buf = io.BytesIO()
+    sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
+    await ws.send_bytes(buf.getvalue())
+
 
 # ══════════════════════════════════════════════════════════════
 #  Web‑Socket 2 :  /translate_text   (text‑only FR → Basaa)
