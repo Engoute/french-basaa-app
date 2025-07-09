@@ -225,7 +225,7 @@ async def translate(ws: WebSocket):
 
     # 2) vocoder decode  – same trick
     wav = await asyncio.to_thread(
-        lambda: tts_vocoder.decode(codes).cpu().numpy().squeeze()
+        lambda: tts_vocoder.decode(codes).detach().cpu().numpy().squeeze()
     )
 
     buf = io.BytesIO()
