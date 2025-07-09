@@ -79,21 +79,15 @@ def whisper_chunks(pcm_f32: np.ndarray, sr=16_000,
     for off in range(0, len(pcm_f32), step):
         yield pcm_f32[off : off + win]
 
-# --- replace the previous helper ------------------------------
+# ------------ 100 % safe Whisper wrapper ----------------------
 def fast_generate_whisper(feats):
-    """
-    Call Whisper.generate() with a max_new_tokens value that keeps the
-    *total* length (forced decoder IDs + generated tokens) ≤ 448.
-    """
-    max_target = 448
-    forced = asr_model.generation_config.forced_decoder_ids or []
-    budget = max_target - len(forced)
     return asr_model.generate(
         feats,
         do_sample=False,
         num_beams=1,
-        max_new_tokens=budget,     # 444 for the French checkpoint
+        max_length=448,          # total length cap (decoder_input_ids + new)
     )
+
 
 
 # ─── model bootstrap ─────────────────────────────────────────
