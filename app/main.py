@@ -231,19 +231,24 @@ async def translate(ws: WebSocket):
     )
 
     tail = gen[0][in_ids.shape[-1]:].tolist()
-    raw = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
-    raw = raw[: (len(raw) // 7) * 7]
+    raw  = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
+    raw  = raw[: (len(raw) // 7) * 7]           # multiple of 7
 
-    tracks = [[], [], []]
+    # ---- revised frame assembly: *clamp* instead of drop ----------
+    tracks = [[], [], []]                       # lvl‑0 / lvl‑1 / lvl‑2
     for i in range(0, len(raw), 7):
-        f = raw[i : i + 7]
-        if any(not 0 <= c < 4096 for c in f): continue
-        tracks[0].append(f[0])
-        tracks[1].extend([f[1], f[4]])
-        tracks[2].extend([f[2], f[3], f[5], f[6]])
+        f0, f1, f2, f3, f4, f5, f6 = raw[i : i + 7]
+        # Clamp each code into the legal SNAC range
+        f0 &= 0xFFF; f1 &= 0xFFF; f2 &= 0xFFF
+        f3 &= 0xFFF; f4 &= 0xFFF; f5 &= 0xFFF; f6 &= 0xFFF
+        tracks[0].append(f0)
+        tracks[1].extend([f1, f4])
+        tracks[2].extend([f2, f3, f5, f6])
+    # ----------------------------------------------------------------
 
-    if tracks[0]:
-        codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0) for t in tracks]
+    if tracks[0]:                                # now never empty
+        codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
+                 for t in tracks]
 
         wav = await asyncio.to_thread(
             lambda: tts_vocoder.decode(codes).detach().cpu().numpy().squeeze()
@@ -258,7 +263,7 @@ async def translate(ws: WebSocket):
 
     await ws.close()
     print(f"⏱  voice pipeline {time.perf_counter()-t0:.2f}s")
-
+    
 # ══════════════════════════════════════════════════════════════
 #  Web‑Socket 2 :  /translate_text
 # ══════════════════════════════════════════════════════════════
