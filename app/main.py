@@ -1,17 +1,19 @@
-# app/main.py  –  latency‑optimised  ●  2025‑07‑10
+# app/main.py  – 2025‑07‑11  (Whisper+MT compiled, Orpheus NOT)
 import asyncio, io, json, os, shutil, tempfile, zipfile, time
 from pathlib import Path
 from typing import List
 
 import gdown, numpy as np, soundfile as sf, torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from websockets.exceptions import ConnectionClosed          # for safe send
+from websockets.exceptions import ConnectionClosed
 from transformers import (
     AutoModelForSpeechSeq2Seq, AutoModelForCausalLM,
     AutoProcessor, AutoTokenizer, M2M100ForConditionalGeneration,
 )
 
-# ═══ SNAC loader (pinned 48‑ch) ═══════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# SNAC loader (pinned to 48‑channel build)
+# ══════════════════════════════════════════════════════════════
 from snac import SNAC
 try:
     from snac.configuration_snac import SnacConfig          # legacy wheel
@@ -74,8 +76,7 @@ def load_snac(model_dir: Path, device="cpu") -> SNAC:
     return voc
 
 # ─── optimisation helpers ────────────────────────────────────
-def whisper_chunks(pcm_f32: np.ndarray, sr=16_000,
-                   win_s=25, hop_s=23):
+def whisper_chunks(pcm_f32: np.ndarray, sr=16_000, win_s=25, hop_s=23):
     step = hop_s * sr
     win  =  win_s * sr
     for off in range(0, len(pcm_f32), step):
@@ -88,10 +89,6 @@ def fast_generate_whisper(feats):
         num_beams=1,
         max_length=448,
     )
-
-def tts_token_budget(text: str, ceiling=9000):
-    est = int(len(text.split()) * 9 * 1.4)
-    return min(max(256, est), ceiling)
 
 # ─── model bootstrap ─────────────────────────────────────────
 def _try_compile(model, name: str):
@@ -109,7 +106,7 @@ def load_models() -> None:
     safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
     safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
 
-    # Whisper
+    # Whisper (compiled)
     asr_dir       = resolve_dir(ASR_MODEL_PATH)
     asr_processor = AutoProcessor.from_pretrained(asr_dir, local_files_only=True)
     asr_model     = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -117,7 +114,7 @@ def load_models() -> None:
     ).eval()
     asr_model     = _try_compile(asr_model, "Whisper")
 
-    # MT
+    # MT (compiled)
     mt_dir       = resolve_dir(MT_MODEL_PATH)
     mt_tokenizer = AutoTokenizer.from_pretrained(mt_dir, local_files_only=True)
     mt_model     = M2M100ForConditionalGeneration.from_pretrained(
@@ -125,7 +122,7 @@ def load_models() -> None:
     ).eval()
     mt_model     = _try_compile(mt_model, "M2M‑100")
 
-    # TTS acoustic + vocoder
+    # Orpheus acoustic (NOT compiled)
     ac_root = resolve_dir(TTS_MODEL_PATH / "acoustic_model")
     vc_root = resolve_dir(TTS_MODEL_PATH / "vocoder")
 
@@ -133,10 +130,8 @@ def load_models() -> None:
     tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
         ac_root, torch_dtype=torch.float16
     ).to(DEVICE).eval()
-    tts_acoustic_model = _try_compile(tts_acoustic_model, "Orpheus‑LM")
 
-    tts_vocoder        = load_snac(vc_root, DEVICE)
-    tts_vocoder.decode = _try_compile(tts_vocoder.decode, "SNAC‑decode")
+    tts_vocoder = load_snac(vc_root, DEVICE)         # decode will stay eager
 
     # Global GPU knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -181,14 +176,12 @@ async def translate(ws: WebSocket):
     except WebSocketDisconnect:
         return
 
-    # ───── ASR ─────
     if not pcm_chunks:
         await ws.close(code=4000, reason="no audio")
         return
     t0 = time.perf_counter()
 
     pcm_f32 = np.concatenate(pcm_chunks).astype(np.float32) / 32768.0
-    # One pass is faster if <25 s
     if len(pcm_f32) < 25 * 16_000:
         with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.float16):
             feats = asr_processor(pcm_f32, sampling_rate=16_000,
@@ -205,7 +198,7 @@ async def translate(ws: WebSocket):
             parts.append(asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip())
         fr = " ".join(parts).strip()
 
-    # ───── MT ─────
+    # MT -------------------------------------------------------------------
     mt_tokenizer.src_lang = "fr"
     enc = mt_tokenizer(fr, return_tensors="pt").to(DEVICE)
     bos = mt_tokenizer.get_lang_id("lg")
@@ -216,40 +209,36 @@ async def translate(ws: WebSocket):
 
     await ws.send_text(json.dumps({"fr": fr, "lg": bas}))
 
-    # ───── TTS ─────
+    # TTS ------------------------------------------------------------------
     prompt = (f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker"
               f"<|text|>{bas}{tts_tokenizer.eos_token}<|audio|>")
     in_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
-    # acoustic model off‑loaded to thread
     gen = await asyncio.to_thread(
         tts_acoustic_model.generate,
         in_ids,
-        max_new_tokens=tts_token_budget(bas),
+        max_new_tokens=4000,                      # ← original value restored
         pad_token_id=tts_tokenizer.pad_token_id,
         eos_token_id=tts_tokenizer.eos_token_id,
     )
 
     tail = gen[0][in_ids.shape[-1]:].tolist()
     raw  = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
-    raw  = raw[: (len(raw) // 7) * 7]           # multiple of 7
+    raw  = raw[: (len(raw) // 7) * 7]
 
-    # ---- revised frame assembly: *clamp* instead of drop ----------
-    tracks = [[], [], []]                       # lvl‑0 / lvl‑1 / lvl‑2
+    # Clamp codes instead of dropping frames
+    tracks = [[], [], []]
     for i in range(0, len(raw), 7):
         f0, f1, f2, f3, f4, f5, f6 = raw[i : i + 7]
-        # Clamp each code into the legal SNAC range
         f0 &= 0xFFF; f1 &= 0xFFF; f2 &= 0xFFF
         f3 &= 0xFFF; f4 &= 0xFFF; f5 &= 0xFFF; f6 &= 0xFFF
         tracks[0].append(f0)
         tracks[1].extend([f1, f4])
         tracks[2].extend([f2, f3, f5, f6])
-    # ----------------------------------------------------------------
 
-    if tracks[0]:                                # now never empty
+    if tracks[0]:
         codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
                  for t in tracks]
-
         wav = await asyncio.to_thread(
             lambda: tts_vocoder.decode(codes).detach().cpu().numpy().squeeze()
         )
@@ -263,7 +252,7 @@ async def translate(ws: WebSocket):
 
     await ws.close()
     print(f"⏱  voice pipeline {time.perf_counter()-t0:.2f}s")
-    
+
 # ══════════════════════════════════════════════════════════════
 #  Web‑Socket 2 :  /translate_text
 # ══════════════════════════════════════════════════════════════
