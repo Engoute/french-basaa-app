@@ -1,4 +1,4 @@
-# app/main.py  – 2025‑07‑11  (Whisper+MT compiled, Orpheus NOT)
+# app/main.py  – 2025‑07‑11  (click‑free fade‑out, Whisper+MT compiled)
 import asyncio, io, json, os, shutil, tempfile, zipfile, time
 from pathlib import Path
 from typing import List
@@ -131,7 +131,7 @@ def load_models() -> None:
         ac_root, torch_dtype=torch.float16
     ).to(DEVICE).eval()
 
-    tts_vocoder = load_snac(vc_root, DEVICE)         # decode will stay eager
+    tts_vocoder = load_snac(vc_root, DEVICE)
 
     # Global GPU knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -217,7 +217,7 @@ async def translate(ws: WebSocket):
     gen = await asyncio.to_thread(
         tts_acoustic_model.generate,
         in_ids,
-        max_new_tokens=4000,                      # ← original value restored
+        max_new_tokens=4000,
         pad_token_id=tts_tokenizer.pad_token_id,
         eos_token_id=tts_tokenizer.eos_token_id,
     )
@@ -226,7 +226,7 @@ async def translate(ws: WebSocket):
     raw  = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
     raw  = raw[: (len(raw) // 7) * 7]
 
-    # Clamp codes instead of dropping frames
+    # Clamp (not drop) codes to avoid length mismatch
     tracks = [[], [], []]
     for i in range(0, len(raw), 7):
         f0, f1, f2, f3, f4, f5, f6 = raw[i : i + 7]
@@ -242,6 +242,11 @@ async def translate(ws: WebSocket):
         wav = await asyncio.to_thread(
             lambda: tts_vocoder.decode(codes).detach().cpu().numpy().squeeze()
         )
+
+        # ── NEW: 5 ms linear fade‑out to remove click ────────────────────
+        fade_len = int(0.005 * 24_000)            # 5 ms at 24 kHz ≈ 120 samples
+        if wav.shape[-1] > fade_len:
+            wav[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=wav.dtype)
 
         buf = io.BytesIO()
         sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
