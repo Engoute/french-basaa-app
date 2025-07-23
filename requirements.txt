@@ -1,36 +1,31 @@
-# ── Networking Stack (unchanged) ────────────────────────────────
+# ── Networking Stack ────────────────────────────────
 fastapi==0.95.2
 starlette==0.27.0
 uvicorn[standard]==0.22.0
 websockets==10.4
 
-# ── Core AI/ML Libraries ────────────────────────────────────────
-# Torch is still a core dependency for vLLM, SNAC, and general tensor ops.
-# Ensure the version matches your CUDA toolkit version (e.g., +cu121 for CUDA 12.1).
-torch
+# ── Core AI/ML Libraries ─────────────────────────────
+# NOTE: PyTorch is pre-installed in the RunPod template. 
+# This is just for reference.
+# torch==2.4.0+cu124
 
-# Transformers is still needed for loading tokenizers for all models.
+# For loading tokenizers
 transformers>=4.42.1
-sentencepiece # Required for the M2M-100 tokenizer.
+sentencepiece
 
-# ── High-Performance Inference Engines (NEW) ────────────────────
-# ✅ Replaces PyTorch for ASR. Uses CTranslate2 for fast Whisper inference.
+# ── High-Performance Inference Engines (CUDA 12.4.1) ──
+# For fast Whisper ASR
 faster-whisper
 
-# ✅ Replaces PyTorch for Machine Translation. Runs the M2M-100 model.
-# Specify -gpu to leverage NVIDIA CUDA cores.
+# For ONNX-based translation. The latest version supports CUDA 12.x
 onnxruntime-gpu
 
-# ✅ Replaces PyTorch for the TTS acoustic model. State-of-the-art LLM engine.
+# For the Orpheus LLM. The latest version supports CUDA 12.4
 vllm
 
-# ── Audio & Utilities ───────────────────────────────────────────
+# ── Audio & Utilities ────────────────────────────────
 soundfile
-
-# ✅ New utility for downloading models from Google Drive in the setup script.
 gdown
 
-# ── Orpheus TTS Vocoder (unchanged) ─────────────────────────────
-# Pick ONE of the next two lines. Using the git pin is recommended for reproducibility.
+# ── Orpheus TTS Vocoder ──────────────────────────────
 snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71
-# snac==1.2.1
