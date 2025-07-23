@@ -24,4 +24,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: lemisteria7/french-basaa-app:latest
+          tags: lemisteria7/french-basaa-app:latest 
