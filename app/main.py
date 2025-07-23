@@ -1,279 +1,228 @@
-# app/main.py  – 2025‑07‑11  (click‑free fade‑out, Whisper+MT compiled)
+# app/main.py – Refined for streaming inference with dedicated engines
 import asyncio, io, json, os, shutil, tempfile, zipfile, time
 from pathlib import Path
-from typing import List
+from typing import AsyncGenerator
 
 import gdown, numpy as np, soundfile as sf, torch
+import onnxruntime as ort
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
-from transformers import (
-    AutoModelForSpeechSeq2Seq, AutoModelForCausalLM,
-    AutoProcessor, AutoTokenizer, M2M100ForConditionalGeneration,
-)
 
-# ══════════════════════════════════════════════════════════════
-# SNAC loader (pinned to 48‑channel build)
-# ══════════════════════════════════════════════════════════════
+from faster_whisper import WhisperModel
+from transformers import AutoTokenizer, M2M100Tokenizer
+from vllm import AsyncLLMEngine, SamplingParams
 from snac import SNAC
-try:
-    from snac.configuration_snac import SnacConfig          # legacy wheel
-except ModuleNotFoundError:
-    class SnacConfig(dict):                                 # type: ignore
-        def __getattr__(self, k): return self[k]
 
-# ─── paths ────────────────────────────────────────────────────
-MODELS_DIR     = Path(os.getenv("MODELS_DIR", "/app/models"))
-ASR_MODEL_PATH = MODELS_DIR / "whisper_fr_inference_v1"
-MT_MODEL_PATH  = MODELS_DIR / "m2m100_basaa_inference_v1"
-TTS_MODEL_PATH = MODELS_DIR / "orpheus_basaa_bundle_16bit_final"
-DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+# ══════════════════════════════════════════════════════════════
+#  Configuration & Paths
+# ══════════════════════════════════════════════════════════════
+MODELS_DIR = Path(os.getenv("MODELS_DIR", "/app/models"))
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# NOTE: Paths now point to directories containing optimized model formats
+# as recommended by the research report (CTranslate2, ONNX, and vLLM-compatible).
+ASR_MODEL_PATH = MODELS_DIR / "whisper-small-fr-ct2"
+MT_MODEL_PATH = MODELS_DIR / "m2m100-fr-basaa-onnx"
+TTS_MODEL_PATH = MODELS_DIR / "orpheus-basaa-vllm"
 
 MODEL_URLS = {
-    "whisper.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/whisper.zip",
-    "m2m100.zip":  "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/m2m100.zip",
-    "orpheus.zip": "https://huggingface.co/datasets/LeMisterIA/basaa-models/resolve/main/orpheus.zip",
+    "whisper_ct2.zip": "URL_TO_FASTER_WHISPER_MODEL.zip", # Placeholder URL
+    "m2m100_onnx.zip": "URL_TO_M2M100_ONNX_MODEL.zip",     # Placeholder URL
+    "orpheus_vllm.zip": "URL_TO_ORPHEUS_VLLM_MODEL.zip",   # Placeholder URL
 }
 
-# ─── globals ──────────────────────────────────────────────────
-asr_model = asr_processor = mt_model = mt_tokenizer = None
-tts_acoustic_model = tts_tokenizer = tts_vocoder = None
+# ─── Globals for service instances ────────────────────────────
+asr_service = None
+mt_service = None
+tts_service = None
 
 app = FastAPI()
 
 # ─── helpers ──────────────────────────────────────────────────
 def safe_unzip(zip_path: Path, dst_dir: Path, url: str) -> None:
     if dst_dir.exists() and any(dst_dir.iterdir()):
+        print(f"✅ Models already exist in {dst_dir}")
         return
+    print(f"Downloading and unzipping models from {url} to {dst_dir}...")
     dst_dir.mkdir(parents=True, exist_ok=True)
     gdown.download(url, str(zip_path), quiet=False, fuzzy=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmp)
-        for itm in Path(tmp).iterdir():
-            shutil.move(str(itm), dst_dir)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(dst_dir)
     os.remove(zip_path)
+    print("✅ Download complete.")
 
-def resolve_dir(root: Path) -> Path:
-    return root if (root / "config.json").exists() else next(root.rglob("config.json")).parent
-
-def wav_to_int16(blob: bytes) -> np.ndarray:
+def wav_to_f32(blob: bytes) -> np.ndarray:
     if blob[:4] == b"RIFF":
-        data, sr = sf.read(io.BytesIO(blob), dtype="int16")
+        data, sr = sf.read(io.BytesIO(blob), dtype="float32")
         if sr != 16_000:
-            raise ValueError("expected 16 kHz WAV")
+            raise ValueError("Expected 16 kHz WAV audio.")
         return data
-    return np.frombuffer(blob, np.int16)
+    # Assume raw int16 bytes if not a WAV file
+    return np.frombuffer(blob, np.int16).astype(np.float32) / 32768.0
 
-def load_snac(model_dir: Path, device="cpu") -> SNAC:
-    cfg = SnacConfig(**json.loads((model_dir / "config.json").read_text()))
-    voc = SNAC(**cfg).to(device)
-    raw = torch.load(model_dir / "pytorch_model.bin", map_location=device)
-    good = {k: v for k, v in raw.items()
-            if k in voc.state_dict() and v.shape == voc.state_dict()[k].shape}
-    voc.load_state_dict(good, strict=False)
-    voc.eval()
-    print("✅  SNAC loaded")
-    return voc
+# ══════════════════════════════════════════════════════════════
+#  Inference Services (as per research report recommendations)
+# ══════════════════════════════════════════════════════════════
 
-# ─── optimisation helpers ────────────────────────────────────
-def whisper_chunks(pcm_f32: np.ndarray, sr=16_000, win_s=25, hop_s=23):
-    step = hop_s * sr
-    win  =  win_s * sr
-    for off in range(0, len(pcm_f32), step):
-        yield pcm_f32[off : off + win]
+class ASRService:
+    """ASR service using faster-whisper (CTranslate2)."""
+    def __init__(self, model_dir: str):
+        print("Loading ASR model (faster-whisper)...")
+        self.model = WhisperModel(model_dir, device=DEVICE, compute_type="float16")
+        print("✅ ASR Service ready.")
 
-def fast_generate_whisper(feats):
-    return asr_model.generate(
-        feats,
-        do_sample=False,
-        num_beams=1,
-        max_length=448,
-    )
+    async def transcribe_stream(self, pcm_f32: np.ndarray) -> AsyncGenerator[str, None]:
+        # faster-whisper's stream yields segments as they are transcribed.
+        segments, _info = self.model.transcribe(pcm_f32, language="fr", beam_size=2)
+        for segment in segments:
+            yield segment.text
 
-# ─── model bootstrap ─────────────────────────────────────────
-def _try_compile(model, name: str):
-    try:
-        return torch.compile(model, mode="reduce-overhead", fullgraph=True)
-    except Exception as ex:
-        print(f"⚠️  torch.compile failed for {name}: {ex}  (continuing without)")
-        return model
+class TranslationService:
+    """Machine Translation service using ONNX Runtime."""
+    def __init__(self, model_dir: Path):
+        print("Loading MT model (ONNX Runtime)...")
+        onnx_path = str(next(model_dir.rglob("*.onnx")))
+        providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.session = ort.InferenceSession(onnx_path, providers=providers)
+        self.tokenizer = M2M100Tokenizer.from_pretrained(model_dir)
+        print("✅ Translation Service ready.")
 
-def load_models() -> None:
-    global asr_model, asr_processor, mt_model, mt_tokenizer
-    global tts_acoustic_model, tts_tokenizer, tts_vocoder
+    def translate(self, text: str) -> str:
+        self.tokenizer.src_lang = "fr"
+        encoded_fr = self.tokenizer(text, return_tensors="np")
+        generated_tokens = self.session.run(
+            None,
+            {"input_ids": encoded_fr["input_ids"], "attention_mask": encoded_fr["attention_mask"]},
+        )[0]
+        basaa_text = self.tokenizer.batch_decode(
+            generated_tokens,
+            skip_special_tokens=True,
+            forced_bos_token_id=self.tokenizer.get_lang_id("lg"),
+        )[0]
+        return basaa_text
 
-    safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper.zip"])
-    safe_unzip(MODELS_DIR / "m2m100.zip",  MT_MODEL_PATH,  MODEL_URLS["m2m100.zip"])
-    safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus.zip"])
+class OrpheusService:
+    """TTS service using vLLM for the acoustic model and a SNAC vocoder."""
+    def __init__(self, model_dir: Path):
+        print("Loading TTS model (vLLM) and SNAC vocoder...")
+        acoustic_dir = model_dir / "acoustic_model"
+        vocoder_dir = model_dir / "vocoder"
 
-    # Whisper (compiled)
-    asr_dir       = resolve_dir(ASR_MODEL_PATH)
-    asr_processor = AutoProcessor.from_pretrained(asr_dir, local_files_only=True)
-    asr_model     = AutoModelForSpeechSeq2Seq.from_pretrained(
-        asr_dir, torch_dtype=torch.float16, device_map={"": 0}, low_cpu_mem_usage=True
-    ).eval()
-    asr_model     = _try_compile(asr_model, "Whisper")
+        self.engine = AsyncLLMEngine.from_engine_args(
+            model=str(acoustic_dir),
+            tokenizer=str(acoustic_dir),
+            tensor_parallel_size=1,
+            dtype="float16",
+            max_model_len=4096,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(acoustic_dir)
+        self.vocoder = SNAC.from_pretrained(str(vocoder_dir)).to(DEVICE)
+        self.sampling_params = SamplingParams(max_tokens=4096, temperature=0.0)
+        print("✅ Orpheus TTS Service ready.")
 
-    # MT (compiled)
-    mt_dir       = resolve_dir(MT_MODEL_PATH)
-    mt_tokenizer = AutoTokenizer.from_pretrained(mt_dir, local_files_only=True)
-    mt_model     = M2M100ForConditionalGeneration.from_pretrained(
-        mt_dir, torch_dtype=torch.float16, device_map={"": 0}
-    ).eval()
-    mt_model     = _try_compile(mt_model, "M2M‑100")
+    async def generate_stream(self, prompt: str) -> AsyncGenerator[bytes, None]:
+        """Generates audio chunks by streaming tokens from vLLM."""
+        full_prompt = (f"{self.tokenizer.bos_token}<|voice|>basaa_speaker"
+                       f"<|text|>{prompt}{self.tokenizer.eos_token}<|audio|>")
+        
+        results_generator = self.engine.generate(full_prompt, self.sampling_params, request_id=f"tts-{time.time()}")
+        
+        token_buffer = []
+        async for result in results_generator:
+            new_tokens = result.outputs[0].token_ids
+            # Replicate the logic from the research report to decode chunks
+            token_buffer.extend(new_tokens[len(token_buffer):])
+            
+            # Decode audio when buffer is a multiple of 7 (SNAC codebook size)
+            # and large enough to be efficient.
+            num_to_decode = (len(token_buffer) // 7) * 7
+            if num_to_decode > 0:
+                codes_to_process = token_buffer[:num_to_decode]
+                token_buffer = token_buffer[num_to_decode:]
 
-    # Orpheus acoustic (NOT compiled)
-    ac_root = resolve_dir(TTS_MODEL_PATH / "acoustic_model")
-    vc_root = resolve_dir(TTS_MODEL_PATH / "vocoder")
+                # Process codes and decode with SNAC
+                raw = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(codes_to_process)]
+                tracks = [[], [], []]
+                for i in range(0, len(raw), 7):
+                    f0, f1, f2, f3, f4, f5, f6 = raw[i: i + 7]
+                    tracks[0].append(f0 & 0xFFF)
+                    tracks[1].extend([f1 & 0xFFF, f4 & 0xFFF])
+                    tracks[2].extend([f2 & 0xFFF, f3 & 0xFFF, f5 & 0xFFF, f6 & 0xFFF])
 
-    tts_tokenizer      = AutoTokenizer.from_pretrained(ac_root, local_files_only=True)
-    tts_acoustic_model = AutoModelForCausalLM.from_pretrained(
-        ac_root, torch_dtype=torch.float16
-    ).to(DEVICE).eval()
+                codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0) for t in tracks]
+                
+                with torch.inference_mode():
+                    wav = self.vocoder.decode(codes).detach().cpu().numpy().squeeze()
+                
+                buf = io.BytesIO()
+                sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
+                yield buf.getvalue()
 
-    tts_vocoder = load_snac(vc_root, DEVICE)
+# ─── Model Bootstrap ──────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    global asr_service, mt_service, tts_service
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    # NOTE: You must provide your own model URLs
+    # safe_unzip(MODELS_DIR / "whisper.zip", ASR_MODEL_PATH, MODEL_URLS["whisper_ct2.zip"])
+    # safe_unzip(MODELS_DIR / "m2m100.zip", MT_MODEL_PATH, MODEL_URLS["m2m100_onnx.zip"])
+    # safe_unzip(MODELS_DIR / "orpheus.zip", TTS_MODEL_PATH, MODEL_URLS["orpheus_vllm.zip"])
 
-    # Global GPU knobs
+    asr_service = ASRService(str(ASR_MODEL_PATH))
+    mt_service = TranslationService(MT_MODEL_PATH)
+    tts_service = OrpheusService(TTS_MODEL_PATH)
+    
+    # Enable CUDA optimizations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.sdp_kernel(enable_flash=True,
-                                   enable_math=False,
-                                   enable_mem_efficient=False)
-
-@app.on_event("startup")
-async def _startup() -> None:
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    load_models()
-    print("🌟 models in VRAM, server ready")
+    print("🌟 All services loaded and server is ready.")
 
 # ══════════════════════════════════════════════════════════════
-#  Web‑Socket 1 :  /translate
+#  Streaming WebSocket Endpoint (/translate)
 # ══════════════════════════════════════════════════════════════
-PING_INTERVAL = 15  # seconds
-
 @app.websocket("/translate")
 async def translate(ws: WebSocket):
     await ws.accept()
-    pcm_chunks: List[np.ndarray] = []
-
-    async def pinger():
-        while True:
-            await asyncio.sleep(PING_INTERVAL)
-            try: await ws.send_bytes(b"\0")
-            except Exception: break
-    asyncio.create_task(pinger())
-
+    pcm_chunks = []
+    
+    # 1. Receive all audio from the client until "DONE"
     try:
         while True:
             msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                return
-            if "text" in msg and msg["text"]:
-                if msg["text"] == "DONE": break
-                continue
-            if msg.get("bytes") is None: continue
-            pcm_chunks.append(wav_to_int16(msg["bytes"]))
+            if msg.get("bytes"):
+                pcm_chunks.append(wav_to_f32(msg["bytes"]))
+            elif msg.get("text") == "DONE":
+                break
     except WebSocketDisconnect:
+        print("Client disconnected during audio reception.")
         return
 
     if not pcm_chunks:
-        await ws.close(code=4000, reason="no audio")
+        await ws.close(code=4000, reason="No audio received.")
         return
-    t0 = time.perf_counter()
 
-    pcm_f32 = np.concatenate(pcm_chunks).astype(np.float32) / 32768.0
-    if len(pcm_f32) < 25 * 16_000:
-        with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.float16):
-            feats = asr_processor(pcm_f32, sampling_rate=16_000,
-                                  return_tensors="pt").input_features.to(DEVICE)
-            ids = fast_generate_whisper(feats)
-        fr = asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
-    else:
-        parts = []
-        for ch in whisper_chunks(pcm_f32):
-            feats = asr_processor(ch, sampling_rate=16_000,
-                                  return_tensors="pt").input_features.to(DEVICE)
-            with torch.inference_mode():
-                ids = fast_generate_whisper(feats)
-            parts.append(asr_processor.batch_decode(ids, skip_special_tokens=True)[0].strip())
-        fr = " ".join(parts).strip()
-
-    # MT -------------------------------------------------------------------
-    mt_tokenizer.src_lang = "fr"
-    enc = mt_tokenizer(fr, return_tensors="pt").to(DEVICE)
-    bos = mt_tokenizer.get_lang_id("lg")
-    with torch.inference_mode():
-        out_ids = mt_model.generate(
-            **enc, forced_bos_token_id=bos, max_new_tokens=512, num_beams=2)
-    bas = mt_tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0]
-
-    await ws.send_text(json.dumps({"fr": fr, "lg": bas}))
-
-    # TTS ------------------------------------------------------------------
-    prompt = (f"{tts_tokenizer.bos_token}<|voice|>basaa_speaker"
-              f"<|text|>{bas}{tts_tokenizer.eos_token}<|audio|>")
-    in_ids = tts_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-
-    gen = await asyncio.to_thread(
-        tts_acoustic_model.generate,
-        in_ids,
-        max_new_tokens=4000,
-        pad_token_id=tts_tokenizer.pad_token_id,
-        eos_token_id=tts_tokenizer.eos_token_id,
-    )
-
-    tail = gen[0][in_ids.shape[-1]:].tolist()
-    raw  = [t - 128_266 - ((i % 7) * 4096) for i, t in enumerate(tail)]
-    raw  = raw[: (len(raw) // 7) * 7]
-
-    # Clamp (not drop) codes to avoid length mismatch
-    tracks = [[], [], []]
-    for i in range(0, len(raw), 7):
-        f0, f1, f2, f3, f4, f5, f6 = raw[i : i + 7]
-        f0 &= 0xFFF; f1 &= 0xFFF; f2 &= 0xFFF
-        f3 &= 0xFFF; f4 &= 0xFFF; f5 &= 0xFFF; f6 &= 0xFFF
-        tracks[0].append(f0)
-        tracks[1].extend([f1, f4])
-        tracks[2].extend([f2, f3, f5, f6])
-
-    if tracks[0]:
-        codes = [torch.tensor(t, dtype=torch.long, device=DEVICE).unsqueeze(0)
-                 for t in tracks]
-        wav = await asyncio.to_thread(
-            lambda: tts_vocoder.decode(codes).detach().cpu().numpy().squeeze()
-        )
-
-        # ── NEW: 5 ms linear fade‑out to remove click ────────────────────
-        fade_len = int(0.005 * 24_000)            # 5 ms at 24 kHz ≈ 120 samples
-        if wav.shape[-1] > fade_len:
-            wav[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=wav.dtype)
-
-        buf = io.BytesIO()
-        sf.write(buf, wav, 24_000, format="WAV", subtype="PCM_16")
-        try:
-            await ws.send_bytes(memoryview(buf.getbuffer()))
-        except (WebSocketDisconnect, ConnectionClosed):
-            return
-
-    await ws.close()
-    print(f"⏱  voice pipeline {time.perf_counter()-t0:.2f}s")
-
-# ══════════════════════════════════════════════════════════════
-#  Web‑Socket 2 :  /translate_text
-# ══════════════════════════════════════════════════════════════
-@app.websocket("/translate_text")
-async def translate_text(ws: WebSocket):
-    await ws.accept()
+    start_time = time.perf_counter()
+    full_pcm = np.concatenate(pcm_chunks)
+    
+    # 2. ASR -> MT -> TTS streaming pipeline
     try:
-        fr = await ws.receive_text()
-        mt_tokenizer.src_lang = "fr"
-        enc = mt_tokenizer(fr, return_tensors="pt").to(DEVICE)
-        bos = mt_tokenizer.get_lang_id("lg")
-        with torch.inference_mode():
-            ids = mt_model.generate(**enc, forced_bos_token_id=bos)
-        bas = mt_tokenizer.batch_decode(ids, skip_special_tokens=True)[0]
-        await ws.send_text(bas)
-    except WebSocketDisconnect:
-        pass
+        # ASR yields transcribed French text segments
+        async for fr_text in asr_service.transcribe_stream(full_pcm):
+            # Translate each segment to Basaa
+            basaa_text = mt_service.translate(fr_text)
+            
+            # Send the transcribed/translated text pair to the client
+            await ws.send_text(json.dumps({"fr": fr_text, "lg": basaa_text}))
+
+            # Stream generated audio chunks for the Basaa text
+            async for audio_chunk in tts_service.generate_stream(basaa_text):
+                await ws.send_bytes(audio_chunk)
+                
+    except (WebSocketDisconnect, ConnectionClosed):
+        print("Client disconnected during streaming.")
+    except Exception as e:
+        print(f"An error occurred during the pipeline: {e}")
     finally:
         await ws.close()
+        end_time = time.perf_counter()
+        print(f"⏱️ Pipeline finished in {end_time - start_time:.2f}s")
