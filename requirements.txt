@@ -1,19 +1,36 @@
-# ── Networking stack ───────────────────────────
+# ── Networking Stack (unchanged) ────────────────────────────────
 fastapi==0.95.2
 starlette==0.27.0
 uvicorn[standard]==0.22.0
 websockets==10.4
 
-# ── Whisper & M2M100 ──────────────────────────
-transformers>=4.42.1
-bitsandbytes
-accelerate
-sentencepiece
+# ── Core AI/ML Libraries ────────────────────────────────────────
+# Torch is still a core dependency for vLLM, SNAC, and general tensor ops.
+# Ensure the version matches your CUDA toolkit version (e.g., +cu121 for CUDA 12.1).
+torch
 
-# ── Audio ─────────────────────────────────────
+# Transformers is still needed for loading tokenizers for all models.
+transformers>=4.42.1
+sentencepiece # Required for the M2M-100 tokenizer.
+
+# ── High-Performance Inference Engines (NEW) ────────────────────
+# ✅ Replaces PyTorch for ASR. Uses CTranslate2 for fast Whisper inference.
+faster-whisper
+
+# ✅ Replaces PyTorch for Machine Translation. Runs the M2M-100 model.
+# Specify -gpu to leverage NVIDIA CUDA cores.
+onnxruntime-gpu
+
+# ✅ Replaces PyTorch for the TTS acoustic model. State-of-the-art LLM engine.
+vllm
+
+# ── Audio & Utilities ───────────────────────────────────────────
 soundfile
 
-# ── Orpheus TTS vocoder (pick ONE of the next two lines) ──
-snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71   # precise pin
-# snac==1.2.1                                                  # or PyPI pin
+# ✅ New utility for downloading models from Google Drive in the setup script.
+gdown
 
+# ── Orpheus TTS Vocoder (unchanged) ─────────────────────────────
+# Pick ONE of the next two lines. Using the git pin is recommended for reproducibility.
+snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71
+# snac==1.2.1
