@@ -28,4 +28,4 @@ soundfile
 gdown
 
 # ── Orpheus TTS Vocoder ──────────────────────────────
-snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71
+snac @ git+https://github.com/hubertsiuzdak/snac.git@8f79a71 
